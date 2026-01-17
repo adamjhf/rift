@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
 use objc2_app_kit::NSRunningApplication;
@@ -10,6 +9,7 @@ use crate::actor::reactor::{
     Reactor, Screen, ScreenSnapshot, StaleCleanupState,
 };
 use crate::actor::wm_controller::WmEvent;
+use crate::common::collections::HashSet;
 use crate::sys::app::AppInfo;
 use crate::sys::screen::{ScreenId, SpaceId};
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
@@ -200,6 +200,7 @@ impl SpaceEventHandler {
         screens: Vec<ScreenSnapshot>,
         ws_info: Vec<WindowServerInfo>,
     ) {
+        reactor.clear_login_window_if_frontmost();
         let previous_displays: HashSet<String> =
             reactor.space_manager.screens.iter().map(|s| s.display_uuid.clone()).collect();
         let new_displays: HashSet<String> =
@@ -288,6 +289,7 @@ impl SpaceEventHandler {
         mut spaces: Vec<Option<SpaceId>>,
         ws_info: Vec<WindowServerInfo>,
     ) {
+        reactor.clear_login_window_if_frontmost();
         // If a topology change is in-flight, ignore space updates that don't match the
         // current screen count; wait for the matching vector before applying changes.
         if reactor.pending_space_change_manager.topology_relayout_pending

@@ -31,6 +31,7 @@ use events::system::SystemEventHandler;
 use events::window::WindowEventHandler;
 use main_window::MainWindowTracker;
 use managers::LayoutManager;
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,7 @@ use crate::layout_engine::{self as layout, Direction, LayoutCommand, LayoutEngin
 use crate::model::VirtualWorkspaceId;
 use crate::model::tx_store::WindowTxStore;
 use crate::model::virtual_workspace::AppRuleResult;
+use crate::sys::app::NSRunningApplicationExt;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt};
@@ -698,6 +700,20 @@ impl Reactor {
         self.recompute_and_set_active_spaces(&raw_spaces);
     }
 
+    fn clear_login_window_if_frontmost(&mut self) {
+        if !self.space_activation_policy.login_window_active {
+            return;
+        }
+        let frontmost_bundle_id = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .and_then(|app| app.bundle_id())
+            .map(|bundle| bundle.to_string());
+        if frontmost_bundle_id.as_deref() != Some("com.apple.loginwindow") {
+            self.space_activation_policy.set_login_window_active(false);
+            self.recompute_and_set_active_spaces_from_current_screens();
+        }
+    }
+
     fn handle_active_space_change(&mut self, previous_active: HashSet<SpaceId>) {
         if previous_active == self.active_spaces {
             return;
@@ -791,9 +807,22 @@ impl Reactor {
             .collect()
     }
 
+    fn bundle_id_for_pid(&self, pid: pid_t) -> Option<String> {
+        self.app_manager
+            .apps
+            .get(&pid)
+            .and_then(|a| a.info.bundle_id.as_deref())
+            .map(ToString::to_string)
+            .or_else(|| {
+                NSRunningApplication::with_process_id(pid)
+                    .and_then(|app| app.bundle_id())
+                    .map(|bundle| bundle.to_string())
+            })
+    }
+
     fn is_login_window_pid(&self, pid: pid_t) -> bool {
-        self.app_manager.apps.get(&pid).and_then(|a| a.info.bundle_id.as_deref())
-            == Some("com.apple.loginwindow")
+        let bundle_id = self.bundle_id_for_pid(pid);
+        bundle_id.as_deref() == Some("com.apple.loginwindow")
     }
 
     // fn store_txid(&self, wsid: Option<WindowServerId>, txid: TransactionId, target: CGRect) {
@@ -1042,6 +1071,9 @@ impl Reactor {
                     self.reconcile_spaces_with_display_history(&raw_spaces, false);
 
                     self.force_refresh_all_windows();
+                } else if self.space_activation_policy.login_window_active {
+                    self.space_activation_policy.set_login_window_active(false);
+                    self.recompute_and_set_active_spaces_from_current_screens();
                 }
             }
             Event::RegisterWmSender(sender) => {
@@ -1103,7 +1135,10 @@ impl Reactor {
             Event::MouseMovedOverWindow(wsid) => {
                 WindowEventHandler::handle_mouse_moved_over_window(self, wsid);
             }
-            Event::SystemWoke => SystemEventHandler::handle_system_woke(self),
+            Event::SystemWoke => {
+                SystemEventHandler::handle_system_woke(self);
+                self.clear_login_window_if_frontmost();
+            }
             Event::MissionControlNativeEntered => {
                 SpaceEventHandler::handle_mission_control_native_entered(self);
             }
@@ -1153,6 +1188,7 @@ impl Reactor {
                     .screen_by_space(space)
                     .and_then(|screen| screen.display_uuid_owned());
 
+                self.clear_login_window_if_frontmost();
                 self.space_activation_policy.toggle_space_activated(
                     cfg,
                     crate::actor::reactor::managers::space_activation::ToggleSpaceContext {
@@ -2049,10 +2085,6 @@ impl Reactor {
     }
 
     fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) {
-        use objc2_app_kit::NSRunningApplication;
-
-        use crate::sys::app::NSRunningApplicationExt;
-
         if self.workspace_switch_manager.active_workspace_switch.is_some() {
             trace!(
                 "Skipping auto workspace switch for pid {} because a workspace switch is in progress",

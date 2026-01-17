@@ -338,6 +338,22 @@ impl WindowEventHandler {
                 reactor.drag_manager.skip_layout_for_window = Some(wid);
             }
 
+            if reactor.display_stabilization_in_progress()
+                && !dragging
+                && reactor
+                    .display_stabilization_window_space_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.contains_key(&wid))
+            {
+                debug!(
+                    ?wid,
+                    ?old_space,
+                    ?new_space,
+                    "Skipping window space change during stabilization"
+                );
+                return false;
+            }
+
             if dragging {
                 reactor.ensure_active_drag(wid, &old_frame);
                 reactor.update_active_drag(wid, &new_frame);

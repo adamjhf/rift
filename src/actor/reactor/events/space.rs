@@ -1,12 +1,13 @@
 use std::collections::hash_map::Entry;
+use std::time::Instant;
 
 use objc2_app_kit::NSRunningApplication;
 use tracing::{debug, info, trace, warn};
 
 use crate::actor::app::Request;
 use crate::actor::reactor::{
-    Event, FullscreenSpaceTrack, FullscreenWindowTrack, MissionControlState, PendingSpaceChange,
-    Reactor, Screen, ScreenSnapshot, StaleCleanupState,
+    DISPLAY_STABILIZATION_MISSING_GRACE, Event, FullscreenSpaceTrack, FullscreenWindowTrack,
+    MissionControlState, PendingSpaceChange, Reactor, Screen, ScreenSnapshot, StaleCleanupState,
 };
 use crate::actor::wm_controller::WmEvent;
 use crate::common::collections::HashSet;
@@ -206,6 +207,10 @@ impl SpaceEventHandler {
         let new_displays: HashSet<String> =
             screens.iter().map(|s| s.display_uuid.clone()).collect();
         let displays_changed = previous_displays != new_displays;
+        let stabilization_active = reactor.display_stabilization_active();
+        let stabilization_ended = !stabilization_active
+            && (!reactor.display_stabilization_stable_displays.is_empty()
+                || !reactor.display_stabilization_active_displays.is_empty());
 
         // IMPORTANT:
         // Only treat display UUID set changes as a "topology change" once we have a prior known set.
@@ -218,9 +223,65 @@ impl SpaceEventHandler {
         let should_trigger_topology = displays_changed
             && (reactor.space_manager.has_seen_display_set || !previous_displays.is_empty());
 
+        if stabilization_active
+            && !reactor.display_stabilization_stable_displays.is_empty()
+            && new_displays.len() < reactor.display_stabilization_stable_displays.len()
+        {
+            if !reactor.display_stabilization_missing_displays {
+                reactor.display_stabilization_missing_displays = true;
+                reactor.display_stabilization_missing_since = Some(Instant::now());
+                debug!(
+                    previous_displays = ?previous_displays,
+                    new_displays = ?new_displays,
+                    stable_displays = ?reactor.display_stabilization_stable_displays,
+                    "Display stabilization missing displays"
+                );
+            }
+            let missing_for = reactor
+                .display_stabilization_missing_since
+                .map(|since| since.elapsed());
+            if missing_for.is_some_and(|elapsed| elapsed < DISPLAY_STABILIZATION_MISSING_GRACE) {
+                return;
+            }
+            debug!(
+                missing_for = ?missing_for,
+                "Display stabilization missing displays exceeded grace; processing screen change"
+            );
+            reactor.display_stabilization_missing_displays = false;
+            reactor.display_stabilization_missing_since = None;
+            reactor.display_stabilization_stable_displays = new_displays.iter().cloned().collect();
+            reactor.display_stabilization_active_displays = new_displays.iter().cloned().collect();
+        }
+        if reactor.display_stabilization_missing_displays
+            && new_displays == reactor.display_stabilization_stable_displays
+        {
+            reactor.display_stabilization_missing_displays = false;
+            reactor.display_stabilization_missing_since = None;
+            debug!(
+                new_displays = ?new_displays,
+                "Display stabilization recovered stable displays"
+            );
+        }
+
         if displays_changed {
             let active_list: Vec<String> = new_displays.iter().cloned().collect();
-            reactor.layout_manager.layout_engine.prune_display_state(&active_list);
+            if stabilization_active {
+                reactor.display_stabilization_active_displays =
+                    active_list.iter().cloned().collect();
+                debug!(
+                    active_displays = ?reactor.display_stabilization_active_displays,
+                    "Deferring display prune during stabilization"
+                );
+            } else {
+                debug!(
+                    active_displays = ?active_list,
+                    "Pruning display state immediately"
+                );
+                reactor.layout_manager.layout_engine.prune_display_state(&active_list);
+            }
+        }
+        if stabilization_ended {
+            reactor.finalize_display_stabilization();
         }
         if !new_displays.is_empty() {
             reactor.space_manager.has_seen_display_set = true;
@@ -267,7 +328,26 @@ impl SpaceEventHandler {
             // Do not remap layout state across reconnects; new space ids can churn and
             // remapping has caused windows to oscillate. Keep existing state and only
             // update the screen→space mapping.
-            reactor.reconcile_spaces_with_display_history(&spaces, false);
+            let stabilization_active = reactor.display_stabilization_active();
+            let allow_remap = reactor.display_stabilization_pending_remap && !stabilization_active;
+            let update_history = !stabilization_active;
+            debug!(
+                stabilization_active,
+                allow_remap,
+                update_history,
+                pending_remap = reactor.display_stabilization_pending_remap,
+                spaces = ?spaces,
+                "ScreenParametersChanged reconcile decision"
+            );
+            reactor.reconcile_spaces_with_display_history_with_history(
+                &spaces,
+                allow_remap,
+                update_history,
+            );
+            if allow_remap {
+                reactor.display_stabilization_pending_remap = false;
+            }
+
             if let Some(info) = ws_info_opt.take() {
                 reactor.finalize_space_change(&spaces, info);
             }
@@ -353,7 +433,25 @@ impl SpaceEventHandler {
 
         reactor.recompute_and_set_active_spaces(&spaces);
 
-        reactor.reconcile_spaces_with_display_history(&spaces, false);
+        let stabilization_active = reactor.display_stabilization_active();
+        let allow_remap = reactor.display_stabilization_pending_remap && !stabilization_active;
+        let update_history = !stabilization_active;
+        debug!(
+            stabilization_active,
+            allow_remap,
+            update_history,
+            pending_remap = reactor.display_stabilization_pending_remap,
+            spaces = ?spaces,
+            "SpaceChanged reconcile decision"
+        );
+        reactor.reconcile_spaces_with_display_history_with_history(
+            &spaces,
+            allow_remap,
+            update_history,
+        );
+        if allow_remap {
+            reactor.display_stabilization_pending_remap = false;
+        }
         info!("space changed");
         reactor.set_screen_spaces(&spaces);
         reactor.finalize_space_change(&spaces, ws_info);

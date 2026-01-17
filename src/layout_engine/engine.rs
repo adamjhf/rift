@@ -127,6 +127,10 @@ impl LayoutEngine {
         self.virtual_workspace_manager.update_settings(settings);
     }
 
+    pub fn space_for_window(&self, window_id: WindowId) -> Option<SpaceId> {
+        self.virtual_workspace_manager.space_for_window(window_id)
+    }
+
     pub fn layout_mode(&self) -> &'static str {
         match &self.tree {
             LayoutSystemKind::Traditional(_) => "traditional",
@@ -526,6 +530,14 @@ impl LayoutEngine {
         }
     }
 
+    pub fn display_last_space_snapshot(&self) -> HashMap<String, SpaceId> {
+        self.display_last_space.clone()
+    }
+
+    pub fn restore_display_last_space(&mut self, snapshot: HashMap<String, SpaceId>) {
+        self.display_last_space = snapshot;
+    }
+
     pub fn last_space_for_display_uuid(&self, display_uuid: &str) -> Option<SpaceId> {
         self.display_last_space.get(display_uuid).copied()
     }
@@ -554,6 +566,15 @@ impl LayoutEngine {
             return;
         }
 
+        debug!(
+            old_space = ?old_space,
+            new_space = ?new_space,
+            display_map_len = self.space_display_map.len(),
+            display_last_len = self.display_last_space.len(),
+            workspaces_len = self.virtual_workspace_manager.get_stats().total_workspaces,
+            "Remapping space"
+        );
+
         self.workspace_layouts.remap_space(old_space, new_space);
         self.floating.remap_space(old_space, new_space);
         self.virtual_workspace_manager.remap_space(old_space, new_space);
@@ -571,6 +592,13 @@ impl LayoutEngine {
 
     pub fn prune_display_state(&mut self, active_display_uuids: &[String]) {
         let active: HashSet<&str> = active_display_uuids.iter().map(|s| s.as_str()).collect();
+
+        debug!(
+            active_displays = ?active_display_uuids,
+            display_map_len = self.space_display_map.len(),
+            display_last_len = self.display_last_space.len(),
+            "Pruning display state"
+        );
 
         self.display_last_space.retain(|uuid, _| active.contains(uuid.as_str()));
 

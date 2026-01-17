@@ -21,7 +21,7 @@ mod testing;
 mod tests;
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use events::app::AppEventHandler;
 use events::command::CommandEventHandler;
@@ -72,6 +72,8 @@ use std::path::PathBuf;
 use crate::model::server::{
     ApplicationData, DisplayData, LayoutStateData, WindowData, WorkspaceData,
 };
+
+const DISPLAY_STABILIZATION_MISSING_GRACE: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
@@ -395,6 +397,16 @@ pub struct Reactor {
     active_spaces: HashSet<SpaceId>,
     display_churn_active: bool,
     display_churn_pending_full_refresh: bool,
+    display_stabilization_until: Option<Instant>,
+    display_stabilization_pending_remap: bool,
+    display_stabilization_last_space_snapshot: Option<HashMap<String, SpaceId>>,
+    display_stabilization_window_space_snapshot: Option<HashMap<WindowId, SpaceId>>,
+    display_stabilization_timer_last_until: Option<Instant>,
+    display_stabilization_active_displays: HashSet<String>,
+    display_stabilization_missing_displays: bool,
+    display_stabilization_missing_since: Option<Instant>,
+    display_stabilization_stable_displays: HashSet<String>,
+    display_stabilization_layout_pending: bool,
 }
 
 #[derive(Debug)]
@@ -598,6 +610,16 @@ impl Reactor {
             active_spaces: HashSet::default(),
             display_churn_active: false,
             display_churn_pending_full_refresh: false,
+            display_stabilization_until: None,
+            display_stabilization_pending_remap: false,
+            display_stabilization_last_space_snapshot: None,
+            display_stabilization_window_space_snapshot: None,
+            display_stabilization_timer_last_until: None,
+            display_stabilization_active_displays: HashSet::default(),
+            display_stabilization_missing_displays: false,
+            display_stabilization_missing_since: None,
+            display_stabilization_stable_displays: HashSet::default(),
+            display_stabilization_layout_pending: false,
         }
     }
 
@@ -616,6 +638,127 @@ impl Reactor {
 
     fn active_space_ids(&self) -> Vec<u64> {
         self.active_spaces.iter().map(|space| space.get()).collect()
+    }
+
+    fn start_display_stabilization(&mut self) {
+        let was_active = self.display_stabilization_until.is_some();
+        self.display_stabilization_until = Some(Instant::now() + Duration::from_secs(3));
+        self.display_stabilization_pending_remap = true;
+        if !was_active {
+            self.display_stabilization_last_space_snapshot =
+                Some(self.layout_manager.layout_engine.display_last_space_snapshot());
+            let snapshot: HashMap<WindowId, SpaceId> = self
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .window_to_workspace
+                .keys()
+                .map(|(space, wid)| (*wid, *space))
+                .collect();
+            debug!(
+                windows = snapshot.len(),
+                "Captured window space snapshot for stabilization"
+            );
+            self.display_stabilization_window_space_snapshot = Some(snapshot);
+        }
+        if self.display_stabilization_active_displays.is_empty() {
+            self.display_stabilization_active_displays = self
+                .space_manager
+                .screens
+                .iter()
+                .filter_map(|screen| screen.display_uuid_owned())
+                .collect();
+        }
+        if self.display_stabilization_stable_displays.is_empty() {
+            self.display_stabilization_stable_displays = self
+                .space_manager
+                .screens
+                .iter()
+                .filter_map(|screen| screen.display_uuid_owned())
+                .collect();
+        }
+        debug!(
+            until = ?self.display_stabilization_until,
+            active_displays = ?self.display_stabilization_active_displays,
+            stable_displays = ?self.display_stabilization_stable_displays,
+            "Started display stabilization"
+        );
+    }
+
+    pub fn finalize_display_stabilization(&mut self) {
+        if self.display_stabilization_missing_displays {
+            let missing_for = self
+                .display_stabilization_missing_since
+                .map(|since| since.elapsed());
+            debug!(
+                missing_for = ?missing_for,
+                "Skipping display stabilization finalize (missing displays)"
+            );
+            return;
+        }
+        if let Some(snapshot) = self.display_stabilization_last_space_snapshot.take() {
+            let snapshot_len = snapshot.len();
+            self.layout_manager
+                .layout_engine
+                .restore_display_last_space(snapshot);
+            debug!(
+                snapshot_len,
+                "Restored display last-space snapshot after stabilization"
+            );
+        }
+        if let Some(snapshot) = self.display_stabilization_window_space_snapshot.take() {
+            debug!(
+                windows = snapshot.len(),
+                "Cleared window space snapshot after stabilization"
+            );
+        }
+        if self.display_stabilization_active_displays.is_empty() {
+            return;
+        }
+        let active_list: Vec<String> =
+            self.display_stabilization_active_displays.iter().cloned().collect();
+        debug!(
+            active_displays = ?active_list,
+            stable_displays = ?self.display_stabilization_stable_displays,
+            missing_displays = self.display_stabilization_missing_displays,
+            "Finalizing display stabilization"
+        );
+        self.layout_manager.layout_engine.prune_display_state(&active_list);
+        self.display_stabilization_active_displays.clear();
+        self.display_stabilization_missing_displays = false;
+        self.display_stabilization_missing_since = None;
+        self.display_stabilization_stable_displays.clear();
+        self.apply_pending_layout_after_stabilization();
+    }
+
+    fn display_stabilization_active(&mut self) -> bool {
+        let Some(until) = self.display_stabilization_until else {
+            return false;
+        };
+        if Instant::now() < until {
+            return true;
+        }
+        if self.display_stabilization_missing_displays {
+            let missing_for = self
+                .display_stabilization_missing_since
+                .map(|since| since.elapsed());
+            let new_until = Instant::now() + Duration::from_secs(3);
+            self.display_stabilization_until = Some(new_until);
+            debug!(
+                missing_for = ?missing_for,
+                until = ?self.display_stabilization_until,
+                "Display stabilization extended (missing displays)"
+            );
+            return true;
+        }
+        debug!(
+            active_displays = ?self.display_stabilization_active_displays,
+            stable_displays = ?self.display_stabilization_stable_displays,
+            missing_displays = self.display_stabilization_missing_displays,
+            "Display stabilization window elapsed"
+        );
+        self.display_stabilization_until = None;
+        false
     }
 
     fn is_window_on_active_space(&self, wid: WindowId) -> bool {
@@ -743,6 +886,14 @@ impl Reactor {
         if !activated.is_empty() || !deactivated.is_empty() {
             self.refresh_window_server_snapshot_for_active_spaces();
             self.check_for_new_windows();
+        }
+
+        if !activated.is_empty() && self.display_stabilization_in_progress() {
+            debug!(
+                activated = ?activated,
+                "Skipping app rules for activated spaces during display stabilization"
+            );
+            return;
         }
 
         if !activated.is_empty() {
@@ -898,43 +1049,160 @@ impl Reactor {
     }
 
     async fn run_reactor_loop(mut self, mut events: Receiver) {
-        while let Some((span, event)) = events.recv().await {
-            let _guard = span.enter();
-            let is_screen_params_changed = matches!(event, Event::ScreenParametersChanged(..));
-            if self.display_churn_active
-                && !Self::is_query_event(&event)
-                && !matches!(
-                    event,
-                    Event::ScreenParametersChanged(..)
-                        | Event::DisplayChurnBegin
-                        | Event::DisplayChurnEnd
-                )
-            {
-                Self::note_windowserver_activity_during_display_churn(&event);
-                if matches!(
-                    event,
-                    Event::WindowServerDestroyed(..)
-                        | Event::WindowServerAppeared(..)
-                        | Event::ResyncAppForWindow(..)
-                ) {
-                    trace!("reactor_drop event={:?}", event);
+        let mut stabilization_timer = Timer::manual();
+        let mut stabilization_timer_armed = false;
+
+        loop {
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    let Some((span, event)) = maybe_event else {
+                        break;
+                    };
+                    let _guard = span.enter();
+                    let is_screen_params_changed = matches!(event, Event::ScreenParametersChanged(..));
+                    if self.display_churn_active
+                        && !Self::is_query_event(&event)
+                        && !matches!(
+                            event,
+                            Event::ScreenParametersChanged(..)
+                                | Event::DisplayChurnBegin
+                                | Event::DisplayChurnEnd
+                        )
+                    {
+                        Self::note_windowserver_activity_during_display_churn(&event);
+                        if matches!(
+                            event,
+                            Event::WindowServerDestroyed(..)
+                                | Event::WindowServerAppeared(..)
+                                | Event::ResyncAppForWindow(..)
+                        ) {
+                            trace!("reactor_drop event={:?}", event);
+                        }
+                        self.display_churn_pending_full_refresh = true;
+                        continue;
+                    }
+
+                    self.handle_event(event);
+
+                    if is_screen_params_changed
+                        && self.display_churn_pending_full_refresh
+                        && !self.display_churn_active
+                    {
+                        self.recover_from_display_churn();
+                    }
+
+                    self.update_display_stabilization_timer(
+                        &mut stabilization_timer,
+                        &mut stabilization_timer_armed,
+                    );
                 }
-                self.display_churn_pending_full_refresh = true;
-                continue;
-            }
-
-            self.handle_event(event);
-
-            if is_screen_params_changed
-                && self.display_churn_pending_full_refresh
-                && !self.display_churn_active
-            {
-                self.recover_from_display_churn();
+                _ = stabilization_timer.next(), if stabilization_timer_armed => {
+                    stabilization_timer_armed = false;
+                    self.handle_display_stabilization_timeout();
+                    self.update_display_stabilization_timer(
+                        &mut stabilization_timer,
+                        &mut stabilization_timer_armed,
+                    );
+                }
             }
         }
     }
 
+    fn update_display_stabilization_timer(
+        &mut self,
+        timer: &mut Timer,
+        armed: &mut bool,
+    ) {
+        let Some(until) = self.display_stabilization_until else {
+            if *armed {
+                debug!("Display stabilization timer disarmed (no active window)");
+            }
+            self.display_stabilization_timer_last_until = None;
+            *armed = false;
+            return;
+        };
+        let now = Instant::now();
+        let until_changed = self.display_stabilization_timer_last_until != Some(until);
+        if until_changed && *armed {
+            debug!(
+                remaining = ?until.duration_since(now),
+                "Display stabilization timer updated"
+            );
+        }
+        if now >= until {
+            if until_changed || !*armed {
+                debug!("Display stabilization timer firing immediately (window elapsed)");
+            }
+            timer.set_next_fire(Duration::from_millis(0));
+            self.display_stabilization_timer_last_until = Some(until);
+            *armed = true;
+            return;
+        }
+        if !*armed || until_changed {
+            debug!(
+                remaining = ?until.duration_since(now),
+                "Display stabilization timer armed"
+            );
+        }
+        timer.set_next_fire(until.duration_since(now));
+        self.display_stabilization_timer_last_until = Some(until);
+        *armed = true;
+    }
+
+    fn handle_display_stabilization_timeout(&mut self) {
+        if self.display_stabilization_active() {
+            debug!("Display stabilization timeout ignored (window still active)");
+            return;
+        }
+        if !self.display_stabilization_pending_remap {
+            debug!("Display stabilization timeout with no pending remap");
+            return;
+        }
+        let spaces = self.raw_spaces_for_current_screens();
+        debug!(
+            spaces = ?spaces,
+            "Applying pending display remap after stabilization timeout"
+        );
+        self.reconcile_spaces_with_display_history_with_history(&spaces, true, true);
+        self.display_stabilization_pending_remap = false;
+        self.finalize_display_stabilization();
+    }
+
+    fn display_stabilization_in_progress(&self) -> bool {
+        if self.display_stabilization_pending_remap {
+            return true;
+        }
+        self.display_stabilization_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    fn space_for_window_during_stabilization(&self, wid: WindowId) -> Option<SpaceId> {
+        if !self.display_stabilization_in_progress() {
+            return None;
+        }
+        let space = self
+            .display_stabilization_window_space_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(&wid).copied())
+            .or_else(|| {
+                debug!(?wid, "No snapshot space for window during stabilization");
+                self.layout_manager.layout_engine.space_for_window(wid)
+            })?;
+        debug!(
+            ?wid,
+            ?space,
+            "Using existing window space during stabilization"
+        );
+        Some(space)
+    }
+
+
     fn recover_from_display_churn(&mut self) {
+        if self.display_stabilization_in_progress() {
+            debug!("Deferring display churn recovery during stabilization");
+            return;
+        }
         self.display_churn_pending_full_refresh = false;
         self.refresh_window_server_snapshot_after_churn();
         self.resync_windows_after_churn();
@@ -992,12 +1260,16 @@ impl Reactor {
 
         match event {
             Event::DisplayChurnBegin => {
+                debug!("Display churn begin");
                 self.display_churn_active = true;
                 self.display_churn_pending_full_refresh = true;
+                self.start_display_stabilization();
                 return;
             }
             Event::DisplayChurnEnd => {
+                debug!("Display churn end");
                 self.display_churn_active = false;
+                self.start_display_stabilization();
                 return;
             }
             _ => {}
@@ -1467,6 +1739,19 @@ impl Reactor {
         spaces: &[Option<SpaceId>],
         allow_remap: bool,
     ) {
+        self.reconcile_spaces_with_display_history_with_history(spaces, allow_remap, true);
+    }
+
+    fn reconcile_spaces_with_display_history_with_history(
+        &mut self,
+        spaces: &[Option<SpaceId>],
+        allow_remap: bool,
+        update_history: bool,
+    ) {
+        if !update_history {
+            debug!("Skipping display history update during stabilization");
+            return;
+        }
         let mut seen_displays: HashSet<String> = HashSet::default();
 
         for (screen, space_opt) in self.space_manager.screens.iter().zip(spaces.iter()) {
@@ -1486,6 +1771,15 @@ impl Reactor {
             } else {
                 None
             };
+            debug!(
+                display_uuid,
+                current_space = ?space,
+                seen_before,
+                last_space = ?last_space,
+                allow_remap,
+                update_history,
+                "Display history state"
+            );
 
             // When a display reconnects, remap the most recent space observed for
             // that display to the newly reported space so layout state follows the
@@ -1649,6 +1943,13 @@ impl Reactor {
         frame: &CGRect,
         window_server_id: Option<WindowServerId>,
     ) -> Option<SpaceId> {
+        if self.display_stabilization_in_progress() {
+            trace!(
+                ?window_server_id,
+                "Using frame-based space mapping during display stabilization"
+            );
+            return self.best_space_for_frame(frame);
+        }
         if let Some(server_id) = window_server_id {
             if let Some(space) = crate::sys::window_server::window_space(server_id) {
                 if self.space_manager.screen_by_space(space).is_some()
@@ -1981,6 +2282,14 @@ impl Reactor {
         app_info: AppInfo,
     ) {
         if window_ids.is_empty() {
+            return;
+        }
+        if self.display_stabilization_in_progress() {
+            debug!(
+                pid,
+                windows = window_ids.len(),
+                "Skipping app rules during display stabilization"
+            );
             return;
         }
 
@@ -3042,10 +3351,51 @@ impl Reactor {
         is_workspace_switch: bool,
         context: &'static str,
     ) -> bool {
+        if self.display_stabilization_missing_displays {
+            let missing_for = self
+                .display_stabilization_missing_since
+                .map(|since| since.elapsed());
+            debug!(
+                missing_for = ?missing_for,
+                "Skipping layout update during display stabilization (missing displays)"
+            );
+            self.display_stabilization_layout_pending = true;
+            return false;
+        }
         self.update_layout(is_resize, is_workspace_switch).unwrap_or_else(|e| {
             warn!(error = ?e, "{}", context);
             false
         })
+    }
+
+    fn apply_pending_layout_after_stabilization(&mut self) {
+        if self.display_stabilization_missing_displays {
+            let missing_for = self
+                .display_stabilization_missing_since
+                .map(|since| since.elapsed());
+            debug!(
+                missing_for = ?missing_for,
+                "Deferring pending layout apply (missing displays)"
+            );
+            return;
+        }
+        if self.display_churn_pending_full_refresh {
+            debug!("Applying pending display churn recovery after stabilization");
+            self.display_stabilization_layout_pending = false;
+            self.recover_from_display_churn();
+            return;
+        }
+        if !self.display_stabilization_layout_pending {
+            return;
+        }
+        self.display_stabilization_layout_pending = false;
+        debug!("Applying pending layout after display stabilization");
+        self.force_refresh_all_windows();
+        self.update_layout_or_warn_with(
+            false,
+            false,
+            "Layout update failed after display stabilization",
+        );
     }
 
     #[instrument(skip(self), fields())]

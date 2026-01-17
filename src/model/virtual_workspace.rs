@@ -542,6 +542,12 @@ impl VirtualWorkspaceManager {
         self.window_to_workspace.get(&(space, window_id)).copied()
     }
 
+    pub fn space_for_window(&self, window_id: WindowId) -> Option<SpaceId> {
+        self.window_to_workspace
+            .iter()
+            .find_map(|(&(space, wid), _)| (wid == window_id).then_some(space))
+    }
+
     pub fn set_last_rule_decision(&mut self, space: SpaceId, window_id: WindowId, value: bool) {
         self.last_rule_decision.insert((space, window_id), value);
     }

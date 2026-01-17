@@ -209,6 +209,9 @@ impl LayoutManager {
         }
         let screens = reactor.space_manager.screens.clone();
         let mut layout_result = LayoutResult::new();
+        let stabilization_active = reactor.display_stabilization_active();
+        let block_history_update =
+            stabilization_active || reactor.display_stabilization_pending_remap;
 
         for screen in screens {
             let Some(space) = screen.space else {
@@ -224,10 +227,12 @@ impl LayoutManager {
                 .layout
                 .gaps
                 .effective_for_display(display_uuid_opt.as_deref());
-            reactor
-                .layout_manager
-                .layout_engine
-                .update_space_display(space, display_uuid_opt.clone());
+            if !block_history_update {
+                reactor
+                    .layout_manager
+                    .layout_engine
+                    .update_space_display(space, display_uuid_opt.clone());
+            }
             let layout =
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     space,

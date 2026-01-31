@@ -155,6 +155,11 @@ impl NotificationCenterInner {
         if unsafe { NSWorkspaceActiveSpaceDidChangeNotification } == name
             || name.to_string() == "NSWorkspaceActiveDisplayDidChangeNotification"
         {
+            let ivars = self.ivars();
+            if ivars.display_churn_active.get() {
+                trace!("Skipping screen changed event during display churn");
+                return;
+            }
             self.send_current_space();
         } else {
             warn!("Unexpected screen changed event: {notif:?}");

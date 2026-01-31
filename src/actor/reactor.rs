@@ -267,6 +267,7 @@ pub struct Reactor {
     active_spaces: HashSet<SpaceId>,
     display_churn_active: bool,
     display_churn_pending_full_refresh: bool,
+    space_display_snapshot: Option<HashMap<SpaceId, Option<String>>>,
 }
 
 impl Reactor {
@@ -395,6 +396,7 @@ impl Reactor {
             active_spaces: HashSet::default(),
             display_churn_active: false,
             display_churn_pending_full_refresh: false,
+            space_display_snapshot: None,
         }
     }
 
@@ -750,12 +752,29 @@ impl Reactor {
 
     fn recover_from_display_churn(&mut self) {
         self.display_churn_pending_full_refresh = false;
-        let spaces: Vec<Option<SpaceId>> = self
-            .space_manager
-            .screens
-            .iter()
-            .map(|screen| screen.space)
-            .collect();
+
+        if let Some(snapshot) = self.space_display_snapshot.take() {
+            for (old_space, display_uuid_opt) in snapshot {
+                if let Some(display_uuid) = display_uuid_opt {
+                    if let Some(new_space) =
+                        crate::sys::screen::current_space_for_display_uuid(&display_uuid)
+                    {
+                        if old_space != new_space
+                            && self
+                                .layout_manager
+                                .layout_engine
+                                .space_display_map()
+                                .contains_key(&old_space)
+                        {
+                            self.layout_manager.layout_engine.remap_space(old_space, new_space);
+                        }
+                    }
+                }
+            }
+        }
+
+        let spaces: Vec<Option<SpaceId>> =
+            self.space_manager.screens.iter().map(|screen| screen.space).collect();
         self.reconcile_spaces_with_display_history(&spaces, true);
         self.refresh_window_server_snapshot_after_churn();
         self.resync_windows_after_churn();
@@ -829,6 +848,8 @@ impl Reactor {
             Event::DisplayChurnBegin => {
                 self.display_churn_active = true;
                 self.display_churn_pending_full_refresh = true;
+                self.space_display_snapshot =
+                    Some(self.layout_manager.layout_engine.space_display_map().clone());
                 return;
             }
             Event::DisplayChurnEnd => {

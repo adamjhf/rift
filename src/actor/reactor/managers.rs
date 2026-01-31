@@ -223,10 +223,12 @@ impl LayoutManager {
                 .layout
                 .gaps
                 .effective_for_display(display_uuid_opt.as_deref());
-            reactor
-                .layout_manager
-                .layout_engine
-                .update_space_display(space, display_uuid_opt.clone());
+            if !reactor.display_churn_active && !reactor.display_churn_pending_full_refresh {
+                reactor
+                    .layout_manager
+                    .layout_engine
+                    .update_space_display(space, display_uuid_opt.clone());
+            }
             let layout =
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     space,

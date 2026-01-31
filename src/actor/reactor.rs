@@ -693,6 +693,13 @@ impl Reactor {
 
     fn recover_from_display_churn(&mut self) {
         self.display_churn_pending_full_refresh = false;
+        let spaces: Vec<Option<SpaceId>> = self
+            .space_manager
+            .screens
+            .iter()
+            .map(|screen| screen.space)
+            .collect();
+        self.reconcile_spaces_with_display_history(&spaces, true);
         self.refresh_window_server_snapshot_after_churn();
         self.resync_windows_after_churn();
         self.force_refresh_all_windows();
@@ -1146,6 +1153,7 @@ impl Reactor {
         allow_remap: bool,
     ) {
         let mut seen_displays: HashSet<String> = HashSet::default();
+        let skip_updates = self.display_churn_active || self.display_churn_pending_full_refresh;
 
         for (screen, space_opt) in self.space_manager.screens.iter().zip(spaces.iter()) {
             let Some(space) = space_opt else {
@@ -1176,9 +1184,11 @@ impl Reactor {
                     }
                 }
             }
-            self.layout_manager
-                .layout_engine
-                .update_space_display(*space, Some(display_uuid.to_string()));
+            if !skip_updates {
+                self.layout_manager
+                    .layout_engine
+                    .update_space_display(*space, Some(display_uuid.to_string()));
+            }
         }
     }
 

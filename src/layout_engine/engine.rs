@@ -2066,6 +2066,10 @@ impl LayoutEngine {
         &mut self.virtual_workspace_manager
     }
 
+    pub(crate) fn space_display_map(&self) -> &HashMap<SpaceId, Option<String>> {
+        &self.space_display_map
+    }
+
     pub fn active_workspace(&self, space: SpaceId) -> Option<crate::model::VirtualWorkspaceId> {
         self.virtual_workspace_manager.active_workspace(space)
     }

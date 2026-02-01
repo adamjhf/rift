@@ -765,7 +765,5 @@ impl LayoutSystem for MasterStackLayoutSystem {
 
     fn rebalance(&mut self, layout: LayoutId) { self.normalize_layout(layout); }
 
-    fn toggle_tile_orientation(&mut self, layout: LayoutId) {
-        self.normalize_layout(layout);
-    }
+    fn toggle_tile_orientation(&mut self, layout: LayoutId) { self.normalize_layout(layout); }
 }

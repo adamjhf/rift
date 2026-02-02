@@ -270,6 +270,20 @@ impl BspLayoutSystem {
         }
     }
 
+    fn has_fullscreen_in_subtree(&self, node: NodeId) -> bool {
+        match self.kind.get(node) {
+            Some(NodeKind::Leaf {
+                fullscreen,
+                fullscreen_within_gaps,
+                ..
+            }) => *fullscreen || *fullscreen_within_gaps,
+            Some(NodeKind::Split { .. }) => node
+                .children(&self.tree.map)
+                .any(|child| self.has_fullscreen_in_subtree(child)),
+            None => false,
+        }
+    }
+
     fn find_layout_root(&self, mut node: NodeId) -> NodeId {
         while let Some(p) = node.parent(&self.tree.map) {
             node = p;
@@ -1180,6 +1194,14 @@ impl LayoutSystem for BspLayoutSystem {
             }
         }
         vec![]
+    }
+
+    fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool {
+        if let Some(state) = self.layouts.get(layout).copied() {
+            self.has_fullscreen_in_subtree(state.root)
+        } else {
+            false
+        }
     }
 
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {

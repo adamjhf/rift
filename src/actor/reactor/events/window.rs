@@ -277,10 +277,6 @@ impl WindowEventHandler {
                 return false;
             }
 
-            if requested.0 {
-                return false;
-            }
-
             if triggered_by_rift {
                 let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
                     return false;
@@ -340,6 +336,23 @@ impl WindowEventHandler {
                     }
                 }
 
+                return false;
+            }
+
+            if requested.0 {
+                if let Some(window) = reactor.window_manager.windows.get_mut(&wid) {
+                    if !window.frame_monotonic.same_as(new_frame) {
+                        debug!(
+                            ?wid,
+                            ?new_frame,
+                            "Requested frame change without pending tx; syncing state"
+                        );
+                        window.frame_monotonic = new_frame;
+                    }
+                }
+                if let Some(wsid) = server_id {
+                    reactor.transaction_manager.remove_for_window(wsid);
+                }
                 return false;
             }
 

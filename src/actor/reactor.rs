@@ -47,8 +47,8 @@ use crate::actor::reactor::events::window_discovery::WindowDiscoveryHandler;
 use crate::actor::{self, menu_bar, stack_line};
 use crate::common::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::config::Config;
-use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
 use crate::layout_engine::utils::compute_tiling_area;
+use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
 use crate::model::space_activation::{SpaceActivationConfig, SpaceActivationPolicy};
 use crate::model::tx_store::WindowTxStore;
 use crate::model::virtual_workspace::AppRuleResult;
@@ -72,8 +72,8 @@ pub(crate) use crate::model::reactor::{
     WindowState,
 };
 pub use crate::model::reactor::{
-    Command, DisplaySelector, DragSession, DragState, MenuState, MissionControlState,
-    FrameChangeKind, ReactorCommand, RefocusState, Requested, StaleCleanupState,
+    Command, DisplaySelector, DragSession, DragState, FrameChangeKind, MenuState,
+    MissionControlState, ReactorCommand, RefocusState, Requested, StaleCleanupState,
     WorkspaceSwitchOrigin, WorkspaceSwitchState,
 };
 
@@ -432,12 +432,7 @@ impl Reactor {
         if self.constraint_probes.contains_key(&wid) {
             return true;
         }
-        if self
-            .layout_manager
-            .layout_engine
-            .window_constraint(wid)
-            .is_some()
-        {
+        if self.layout_manager.layout_engine.window_constraint(wid).is_some() {
             return false;
         }
         if self.layout_manager.layout_engine.is_window_floating(wid) {
@@ -467,11 +462,7 @@ impl Reactor {
         let target = compute_tiling_area(screen.frame, &gaps);
         let txid = self.transaction_manager.generate_next_txid(wsid);
         self.transaction_manager.store_txid(wsid, txid, target);
-        if app_state
-            .handle
-            .send(Request::SetWindowFrame(wid, target, txid, true))
-            .is_err()
-        {
+        if app_state.handle.send(Request::SetWindowFrame(wid, target, txid, true)).is_err() {
             self.transaction_manager.remove_for_window(wsid);
             return false;
         }

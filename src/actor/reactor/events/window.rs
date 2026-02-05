@@ -229,25 +229,18 @@ impl WindowEventHandler {
                     } else {
                         None
                     };
-                    let max_h =
-                        if new_frame.size.height.is_within(0.1, probe.target.size.height) {
-                            None
-                        } else if new_frame.size.height < probe.target.size.height {
-                            Some(new_frame.size.height)
-                        } else {
-                            None
-                        };
+                    let max_h = if new_frame.size.height.is_within(0.1, probe.target.size.height) {
+                        None
+                    } else if new_frame.size.height < probe.target.size.height {
+                        Some(new_frame.size.height)
+                    } else {
+                        None
+                    };
                     let constraint = WindowConstraint { max_w, max_h };
-                    reactor
-                        .layout_manager
-                        .layout_engine
-                        .set_window_constraint(wid, constraint);
+                    reactor.layout_manager.layout_engine.set_window_constraint(wid, constraint);
                     reactor.constraint_probes.remove(&wid);
-                    if let Some(app_info) = reactor
-                        .app_manager
-                        .apps
-                        .get(&wid.pid)
-                        .map(|app| app.info.clone())
+                    if let Some(app_info) =
+                        reactor.app_manager.apps.get(&wid.pid).map(|app| app.info.clone())
                     {
                         reactor.process_windows_for_app_rules(wid.pid, vec![wid], app_info);
                     } else if let Some(space) =

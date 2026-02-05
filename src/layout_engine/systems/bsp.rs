@@ -43,9 +43,7 @@ impl BspLayoutSystem {
         self.constraints.insert(wid, constraint);
     }
 
-    pub fn clear_window_constraint(&mut self, wid: WindowId) {
-        self.constraints.remove(&wid);
-    }
+    pub fn clear_window_constraint(&mut self, wid: WindowId) { self.constraints.remove(&wid); }
 
     pub fn window_constraint(&self, wid: WindowId) -> Option<WindowConstraint> {
         self.constraints.get(&wid).copied()
@@ -529,10 +527,9 @@ impl BspLayoutSystem {
         horizontal: bool,
     ) -> Option<f64> {
         match self.kind.get(node) {
-            Some(NodeKind::Leaf { window: Some(w), .. }) => self
-                .constraints
-                .get(w)
-                .and_then(|c| c.cap_for_axis(horizontal)),
+            Some(NodeKind::Leaf { window: Some(w), .. }) => {
+                self.constraints.get(w).and_then(|c| c.cap_for_axis(horizontal))
+            }
             Some(NodeKind::Split { orientation, .. }) => {
                 let mut it = node.children(&self.tree.map);
                 let first = it.next()?;
@@ -688,13 +685,10 @@ mod tests {
         let layout = system.create_layout();
         system.add_window_after_selection(layout, w(1));
         system.add_window_after_selection(layout, w(2));
-        system.set_window_constraint(
-            w(1),
-            WindowConstraint {
-                max_w: Some(300.0),
-                max_h: None,
-            },
-        );
+        system.set_window_constraint(w(1), WindowConstraint {
+            max_w: Some(300.0),
+            max_h: None,
+        });
 
         let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 600.0));
         let gaps = GapSettings::default();
@@ -707,20 +701,8 @@ mod tests {
             HorizontalPlacement::Top,
             VerticalPlacement::Left,
         );
-        let w1_width = frames
-            .iter()
-            .find(|(wid, _)| *wid == w(1))
-            .unwrap()
-            .1
-            .size
-            .width;
-        let w2_width = frames
-            .iter()
-            .find(|(wid, _)| *wid == w(2))
-            .unwrap()
-            .1
-            .size
-            .width;
+        let w1_width = frames.iter().find(|(wid, _)| *wid == w(1)).unwrap().1.size.width;
+        let w2_width = frames.iter().find(|(wid, _)| *wid == w(2)).unwrap().1.size.width;
         assert!(w1_width.is_within(0.5, 300.0));
         assert!(w2_width.is_within(0.5, 700.0));
     }

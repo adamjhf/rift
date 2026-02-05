@@ -2517,10 +2517,8 @@ impl Layout {
         } else {
             (axis_len - total_gap).max(0.0)
         };
-        let weights: Vec<f64> = children
-            .iter()
-            .map(|child| f64::from(self.info[*child].size))
-            .collect();
+        let weights: Vec<f64> =
+            children.iter().map(|child| f64::from(self.info[*child].size)).collect();
         let caps: Vec<Option<f64>> = children
             .iter()
             .map(|child| self.max_len_for_node(map, window, *child, gaps, horizontal, constraints))
@@ -2711,13 +2709,10 @@ mod tests {
         system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);
         system.add_window_after_selection(layout, w(1));
         system.add_window_after_selection(layout, w(2));
-        system.set_window_constraint(
-            w(1),
-            WindowConstraint {
-                max_w: Some(300.0),
-                max_h: None,
-            },
-        );
+        system.set_window_constraint(w(1), WindowConstraint {
+            max_w: Some(300.0),
+            max_h: None,
+        });
 
         let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 600.0));
         let gaps = GapSettings::default();
@@ -2730,20 +2725,8 @@ mod tests {
             HorizontalPlacement::Top,
             VerticalPlacement::Left,
         );
-        let w1_width = frames
-            .iter()
-            .find(|(wid, _)| *wid == w(1))
-            .unwrap()
-            .1
-            .size
-            .width;
-        let w2_width = frames
-            .iter()
-            .find(|(wid, _)| *wid == w(2))
-            .unwrap()
-            .1
-            .size
-            .width;
+        let w1_width = frames.iter().find(|(wid, _)| *wid == w(1)).unwrap().1.size.width;
+        let w2_width = frames.iter().find(|(wid, _)| *wid == w(2)).unwrap().1.size.width;
         assert!(w1_width.is_within(0.5, 300.0));
         assert!(w2_width.is_within(0.5, 700.0));
     }

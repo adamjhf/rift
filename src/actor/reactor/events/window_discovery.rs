@@ -381,9 +381,7 @@ impl WindowDiscoveryHandler {
                             }
                             let should_float =
                                 decision.floating || (!decision.prev_rule_decision && was_floating);
-                            if !should_float
-                                && reactor.maybe_start_constraint_probe(*wid, space)
-                            {
+                            if !should_float && reactor.maybe_start_constraint_probe(*wid, space) {
                                 deferred.insert(*wid);
                             }
                         }

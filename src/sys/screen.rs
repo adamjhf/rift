@@ -719,7 +719,9 @@ mod test {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::CGError;
 
-    use super::{constrain_display_bounds, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System};
+    use super::{
+        CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System, constrain_display_bounds,
+    };
     use crate::sys::screen::{SpaceId, order_visible_spaces_by_position};
 
     struct Stub {

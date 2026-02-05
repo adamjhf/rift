@@ -13,11 +13,7 @@ pub struct WindowConstraint {
 
 impl WindowConstraint {
     pub fn cap_for_axis(self, horizontal: bool) -> Option<f64> {
-        if horizontal {
-            self.max_w
-        } else {
-            self.max_h
-        }
+        if horizontal { self.max_w } else { self.max_h }
     }
 }
 

@@ -4,13 +4,13 @@ use tracing::{debug, trace, warn};
 use crate::actor::app::WindowId;
 use crate::actor::reactor::events::drag::DragEventHandler;
 use crate::actor::reactor::{
-    DragState, FrameChangeKind, Quiet, Reactor, Requested, TransactionId, WindowFilter,
-    WindowState, utils,
+    utils, DragState, FrameChangeKind, Quiet, Reactor, Requested, TransactionId, WindowFilter,
+    WindowState,
 };
 use crate::common::config::LayoutMode;
 use crate::layout_engine::{LayoutEvent, WindowConstraint};
 use crate::sys::app::WindowInfo as Window;
-use crate::sys::event::{MouseState, get_mouse_state};
+use crate::sys::event::{get_mouse_state, MouseState};
 use crate::sys::geometry::{IsWithin, SameAs};
 use crate::sys::screen::SpaceId;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};

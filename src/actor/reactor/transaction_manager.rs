@@ -35,8 +35,11 @@ impl TransactionManager {
         }
     }
 
-    /// Removes the transaction ID entry for a window.
-    pub fn remove_for_window(&self, wsid: WindowServerId) { self.store.remove(&wsid); }
+    /// Clears a window's pending target frame while preserving monotonic txid sequence.
+    pub fn remove_for_window(&self, wsid: WindowServerId) { self.store.clear_target(&wsid); }
+
+    /// Purges all transaction state for a window (used when the window is destroyed).
+    pub fn purge_for_window(&self, wsid: WindowServerId) { self.store.remove(&wsid); }
 
     /// Clears the pending target for a window while preserving its last txid.
     pub fn clear_target_for_window(&self, wsid: WindowServerId) { self.store.clear_target(&wsid); }

@@ -35,13 +35,13 @@ impl WindowTxStore {
         self.0.get(id).map(|entry| *entry)
     }
 
-    pub fn remove(&self, id: &WindowServerId) { self.0.remove(id); }
-
     pub fn clear_target(&self, id: &WindowServerId) {
-        if let Some(mut record) = self.0.get_mut(id) {
-            record.target = None;
+        if let Some(mut entry) = self.0.get_mut(id) {
+            entry.target = None;
         }
     }
+
+    pub fn remove(&self, id: &WindowServerId) { self.0.remove(id); }
 
     pub fn next_txid(&self, id: WindowServerId) -> TransactionId {
         let new_txid = match self.0.entry(id) {
@@ -127,5 +127,18 @@ mod tests {
         let record = store.get(&wsid).expect("tx record should exist");
         assert_eq!(record.txid, txid_2);
         assert_eq!(record.target, None);
+    }
+
+    #[test]
+    fn remove_purges_txid_state() {
+        let store = WindowTxStore::new();
+        let wsid = WindowServerId::new(7);
+        let tx1 = store.next_txid(wsid);
+        store.remove(&wsid);
+        assert!(store.get(&wsid).is_none());
+
+        let tx2 = store.next_txid(wsid);
+        assert_eq!(tx2, TransactionId::default().next());
+        assert_eq!(tx1, tx2);
     }
 }

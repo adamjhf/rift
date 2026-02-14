@@ -370,6 +370,7 @@ impl Reactor {
             },
             notification_manager: managers::NotificationManager {
                 last_sls_notification_ids: Vec::new(),
+                last_layout_modes_by_space: HashMap::default(),
                 _window_notify_tx: window_notify_tx,
             },
             transaction_manager: transaction_manager::TransactionManager::new(window_tx_store),
@@ -831,6 +832,10 @@ impl Reactor {
         }
 
         let should_update_notifications = Self::should_update_notifications(&event);
+        let skip_layout_update = matches!(
+            &event,
+            Event::WindowFrameChanged(_, _, _, Requested(true), _, _)
+        );
 
         let raised_window = self.main_window_tracker.handle_event(&event);
         let mut is_resize = false;
@@ -981,6 +986,7 @@ impl Reactor {
             is_resize,
             window_was_destroyed,
             should_update_notifications,
+            skip_layout_update,
         );
     }
 
@@ -990,6 +996,7 @@ impl Reactor {
         is_resize: bool,
         window_was_destroyed: bool,
         should_update_notifications: bool,
+        skip_layout_update: bool,
     ) {
         if self.display_churn_active || self.display_churn_pending_full_refresh {
             return;
@@ -1007,7 +1014,7 @@ impl Reactor {
         }
 
         let mut layout_changed = false;
-        if !self.is_in_drag() || window_was_destroyed {
+        if !skip_layout_update && (!self.is_in_drag() || window_was_destroyed) {
             layout_changed = self.update_layout_or_warn(
                 is_resize,
                 matches!(
@@ -1047,6 +1054,7 @@ impl Reactor {
                 self.notification_manager.last_sls_notification_ids = ids;
             }
         }
+        self.update_event_tap_layout_mode();
     }
 
     fn create_window_data(&self, window_id: WindowId) -> Option<WindowData> {
@@ -2060,6 +2068,7 @@ impl Reactor {
                     &layout::LayoutCommand::SwitchToWorkspace(workspace_index),
                 );
                 self.handle_layout_response(response, Some(window_space));
+                self.update_event_tap_layout_mode();
             }
         }
     }
@@ -2082,7 +2091,52 @@ impl Reactor {
         let layout::EventResponse {
             raise_windows,
             mut focus_window,
+            boundary_hit,
         } = response;
+
+        if let Some(dir) = boundary_hit
+            && self.config.settings.layout.scrolling.gestures.propagate_to_workspace_swipe
+        {
+            let skip_empty = self.config.settings.gestures.skip_empty;
+            let cmd = if self.config.settings.gestures.invert_horizontal_swipe {
+                match dir {
+                    Direction::Left => Some(layout::LayoutCommand::PrevWorkspace(Some(skip_empty))),
+                    Direction::Right => {
+                        Some(layout::LayoutCommand::NextWorkspace(Some(skip_empty)))
+                    }
+                    _ => None,
+                }
+            } else {
+                match dir {
+                    Direction::Left => Some(layout::LayoutCommand::NextWorkspace(Some(skip_empty))),
+                    Direction::Right => {
+                        Some(layout::LayoutCommand::PrevWorkspace(Some(skip_empty)))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(cmd) = cmd {
+                let space = workspace_switch_space.or_else(|| self.workspace_command_space());
+                if let Some(space) = space {
+                    let resp = self
+                        .layout_manager
+                        .layout_engine
+                        .handle_virtual_workspace_command(space, &cmd);
+
+                    if self.config.settings.gestures.haptics_enabled {
+                        let _ = crate::sys::haptics::perform_haptic(
+                            self.config.settings.gestures.haptic_pattern,
+                        );
+                    }
+
+                    // Recurse to handle the new response (e.g. focus window on the new workspace)
+                    self.handle_layout_response(resp, Some(space));
+                    self.update_event_tap_layout_mode();
+                    return;
+                }
+            }
+        }
+
         let original_focus = focus_window;
 
         let focus_quiet = if workspace_switch_space.is_some() {
@@ -2568,6 +2622,42 @@ impl Reactor {
             && matches!(self.menu_manager.menu_state, MenuState::Closed)
             && !self.is_mission_control_active();
         self.set_focus_follows_mouse_enabled(should_enable);
+    }
+
+    fn update_event_tap_layout_mode(&mut self) {
+        let Some(event_tap_tx) = self.communication_manager.event_tap_tx.as_ref() else {
+            return;
+        };
+
+        let last_modes = &self.notification_manager.last_layout_modes_by_space;
+        let mut modes: Vec<(SpaceId, crate::common::config::LayoutMode)> =
+            Vec::with_capacity(self.space_manager.screens.len());
+        let mut changed = false;
+
+        for screen in &self.space_manager.screens {
+            let Some(space) = screen.space else {
+                continue;
+            };
+
+            // Keep first occurrence only if multiple screens briefly report the same space.
+            if modes.iter().any(|(existing, _)| *existing == space) {
+                continue;
+            }
+
+            let mode = self.layout_manager.layout_engine.active_layout_mode_at(space);
+            if last_modes.get(&space).copied() != Some(mode) {
+                changed = true;
+            }
+            modes.push((space, mode));
+        }
+
+        if modes.is_empty() || (!changed && modes.len() == last_modes.len()) {
+            return;
+        }
+
+        let modes_by_space = modes.iter().copied().collect();
+        self.notification_manager.last_layout_modes_by_space = modes_by_space;
+        event_tap_tx.send(crate::actor::event_tap::Request::LayoutModesChanged(modes));
     }
 
     fn set_mission_control_active(&mut self, active: bool) {

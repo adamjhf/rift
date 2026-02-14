@@ -1,4 +1,4 @@
-use objc2_core_foundation::{CGPoint, CGSize};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use test_log::test;
 
 use super::testing::*;
@@ -101,6 +101,40 @@ fn it_manages_windows_on_enabled_spaces() {
     assert_eq!(
         full_screen,
         apps.windows.get(&WindowId::new(1, 1)).expect("Window was not resized").frame,
+    );
+}
+
+#[test]
+fn requested_frame_change_does_not_trigger_immediate_layout_writeback() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+    reactor.handle_event(screen_params_event(
+        vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+        vec![Some(SpaceId::new(1))],
+        vec![],
+    ));
+
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    apps.simulate_until_quiet(&mut reactor);
+    assert!(apps.requests().is_empty());
+
+    reactor.handle_event(Event::WindowFrameChanged(
+        WindowId::new(1, 1),
+        CGRect::new(CGPoint::new(0., 0.), CGSize::new(400., 1000.)),
+        Some(TransactionId::default().next()),
+        Requested(true),
+        FrameChangeKind::Resize,
+        None,
+    ));
+
+    let requests = apps.requests();
+    assert!(
+        requests.is_empty(),
+        "requested frame event should not trigger immediate layout writeback: {requests:?}"
     );
 }
 
@@ -266,6 +300,7 @@ fn handle_layout_response_groups_windows_by_app_and_screen() {
                 WindowId::new(2, 2),
             ],
             focus_window: None,
+            boundary_hit: None,
         },
         None,
     );
@@ -309,6 +344,7 @@ fn handle_layout_response_includes_handles_for_raise_and_focus_windows() {
         layout::EventResponse {
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(2, 1)),
+            boundary_hit: None,
         },
         None,
     );

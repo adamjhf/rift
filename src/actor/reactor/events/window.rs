@@ -7,6 +7,7 @@ use crate::actor::reactor::{
     DragState, FrameChangeKind, Quiet, Reactor, Requested, TransactionId, WindowFilter,
     WindowState, utils,
 };
+use crate::common::config::LayoutMode;
 use crate::layout_engine::{LayoutEvent, WindowConstraint};
 use crate::sys::app::WindowInfo as Window;
 use crate::sys::event::{MouseState, get_mouse_state};
@@ -80,7 +81,7 @@ impl WindowEventHandler {
             None => return false,
         };
         if let Some(ws_id) = window_server_id {
-            reactor.transaction_manager.remove_for_window(ws_id);
+            reactor.transaction_manager.purge_for_window(ws_id);
             reactor.window_manager.window_ids.remove(&ws_id);
             reactor.window_server_info_manager.window_server_info.remove(&ws_id);
             reactor.window_manager.visible_windows.remove(&ws_id);
@@ -221,22 +222,13 @@ impl WindowEventHandler {
                     if let Some(wsid) = server_id {
                         reactor.transaction_manager.remove_for_window(wsid);
                     }
-                    let max_w = if new_frame.size.width.is_within(0.1, probe.target.size.width) {
-                        None
-                    } else if new_frame.size.width < probe.target.size.width {
-                        Some(new_frame.size.width)
-                    } else {
-                        None
-                    };
-                    let max_h = if new_frame.size.height.is_within(0.1, probe.target.size.height) {
-                        None
-                    } else if new_frame.size.height < probe.target.size.height {
-                        Some(new_frame.size.height)
-                    } else {
-                        None
-                    };
-                    let constraint = WindowConstraint { max_w, max_h };
-                    reactor.layout_manager.layout_engine.set_window_constraint(wid, constraint);
+                    let inferred = infer_constraint_from_target(new_frame, probe.target);
+                    let existing = reactor.layout_manager.layout_engine.window_constraint(wid);
+                    let constraint = merge_constraints(existing, inferred);
+                    reactor
+                        .layout_manager
+                        .layout_engine
+                        .set_window_constraint(wid, constraint);
                     reactor.constraint_probes.remove(&wid);
                     if let Some(app_info) =
                         reactor.app_manager.apps.get(&wid.pid).map(|app| app.info.clone())
@@ -263,7 +255,7 @@ impl WindowEventHandler {
             let mut triggered_by_rift =
                 has_pending_request && last_seen.is_some_and(|seen| seen == last_sent_txid);
 
-            if mouse_state == Some(MouseState::Down) && triggered_by_rift {
+            if effective_mouse_state == Some(MouseState::Down) && triggered_by_rift {
                 if let Some((wsid, _)) = pending_target {
                     reactor.transaction_manager.remove_for_window(wsid);
                 }
@@ -294,8 +286,35 @@ impl WindowEventHandler {
                         debug!(?wid, ?new_frame, ?target, "Resize constrained by window");
                         window.frame_monotonic = new_frame;
                         reactor.transaction_manager.remove_for_window(wsid);
+                        let origin_matches_target = new_frame.origin.same_as(target.origin);
                         let _ = window;
 
+                        if !origin_matches_target {
+                            trace!(
+                                ?wid,
+                                ?new_frame,
+                                ?target,
+                                "Skipping constrained resize handling for intermediate frame before move settled"
+                            );
+                            return false;
+                        }
+
+                        let inferred = infer_constraint_from_target(new_frame, target);
+                        let existing_constraint =
+                            reactor.layout_manager.layout_engine.window_constraint(wid);
+                        let constraint = merge_constraints(existing_constraint, inferred);
+                        reactor
+                            .layout_manager
+                            .layout_engine
+                            .set_window_constraint(wid, constraint);
+                        if existing_constraint == Some(constraint) {
+                            trace!(
+                                ?wid,
+                                ?constraint,
+                                "Constraint unchanged; suppressing duplicate constrained resize layout event"
+                            );
+                            return false;
+                        }
                         if active_space_for_window(reactor, &new_frame, server_id).is_some() {
                             let screens = reactor
                                 .space_manager
@@ -368,13 +387,13 @@ impl WindowEventHandler {
                 let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
                     return false;
                 };
-                if window.frame_monotonic == new_frame {
+                if window.frame_monotonic.same_as(new_frame) {
                     return false;
                 }
                 window.frame_monotonic = new_frame;
             }
 
-            let dragging = mouse_state == Some(MouseState::Down) || reactor.is_in_drag();
+            let dragging = effective_mouse_state == Some(MouseState::Down) || reactor.is_in_drag();
 
             if !dragging {
                 reactor.drag_manager.skip_layout_for_window = Some(wid);
@@ -383,7 +402,7 @@ impl WindowEventHandler {
             if dragging {
                 reactor.ensure_active_drag(wid, &old_frame);
                 reactor.update_active_drag(wid, &new_frame);
-                let is_resize = old_frame.size != new_frame.size;
+                let is_resize = !old_frame.size.same_as(new_frame.size);
                 if is_resize {
                     if active_space_for_window(reactor, &new_frame, server_id).is_some() {
                         let screens = reactor
@@ -407,6 +426,27 @@ impl WindowEventHandler {
                 }
             } else {
                 if old_space != new_space {
+                    let keep_assigned_for_scrolling = old_space.is_some_and(|space| {
+                        reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                            == LayoutMode::Scrolling
+                            && !reactor.layout_manager.layout_engine.is_window_floating(wid)
+                            && reactor
+                                .layout_manager
+                                .layout_engine
+                                .virtual_workspace_manager()
+                                .workspace_for_window(space, wid)
+                                .is_some()
+                    });
+                    if keep_assigned_for_scrolling {
+                        debug!(
+                            ?wid,
+                            ?old_space,
+                            ?new_space,
+                            "Ignoring geometry-only space change for scrolling tiled window"
+                        );
+                        return false;
+                    }
+
                     reactor.send_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid));
                     if let Some(space) = new_space {
                         if reactor.is_space_active(space) {
@@ -429,7 +469,7 @@ impl WindowEventHandler {
                         }
                     }
                     let _ = reactor.update_layout_or_warn(false, false);
-                } else if old_frame.size != new_frame.size {
+                } else if !old_frame.size.same_as(new_frame.size) {
                     if let Some(space) = old_space {
                         if reactor.is_space_active(space) {
                             let screens = reactor
@@ -534,5 +574,48 @@ fn handle_mouse_up_if_needed(reactor: &mut Reactor, mouse_state: Option<MouseSta
         ) || reactor.drag_manager.skip_layout_for_window.is_some())
     {
         DragEventHandler::handle_mouse_up(reactor);
+    }
+}
+
+fn infer_constraint_from_target(new_frame: CGRect, target: CGRect) -> WindowConstraint {
+    let max_w = if new_frame.size.width.is_within(0.1, target.size.width) {
+        None
+    } else if new_frame.size.width < target.size.width {
+        Some(new_frame.size.width)
+    } else {
+        None
+    };
+
+    let max_h = if new_frame.size.height.is_within(0.1, target.size.height) {
+        None
+    } else if new_frame.size.height < target.size.height {
+        Some(new_frame.size.height)
+    } else {
+        None
+    };
+
+    WindowConstraint { max_w, max_h }
+}
+
+fn merge_constraints(
+    existing: Option<WindowConstraint>,
+    inferred: WindowConstraint,
+) -> WindowConstraint {
+    fn merge_axis(existing: Option<f64>, inferred: Option<f64>) -> Option<f64> {
+        match (existing, inferred) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    if let Some(existing) = existing {
+        WindowConstraint {
+            max_w: merge_axis(existing.max_w, inferred.max_w),
+            max_h: merge_axis(existing.max_h, inferred.max_h),
+        }
+    } else {
+        inferred
     }
 }

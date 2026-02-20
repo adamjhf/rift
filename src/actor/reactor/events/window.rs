@@ -4,8 +4,8 @@ use tracing::{debug, trace, warn};
 use crate::actor::app::WindowId;
 use crate::actor::reactor::events::drag::DragEventHandler;
 use crate::actor::reactor::{
-    DragState, FrameChangeKind, Quiet, Reactor, Requested, TransactionId, WindowFilter,
-    WindowState, utils,
+    ConstraintAxisEvidence, ConstraintEvidence, DragState, FrameChangeKind, Quiet, Reactor,
+    Requested, TransactionId, WindowFilter, WindowState, utils,
 };
 use crate::common::config::LayoutMode;
 use crate::layout_engine::{LayoutEvent, WindowConstraint};
@@ -16,6 +16,11 @@ use crate::sys::screen::SpaceId;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
 pub struct WindowEventHandler;
+
+const CONSTRAINT_CONFIRMATION_SAMPLES: u8 = 2;
+const CONSTRAINT_INVALIDATION_SAMPLES: u8 = 2;
+const CONSTRAINT_TARGET_EPS: f64 = 0.1;
+const CONSTRAINT_CAP_EPS: f64 = 0.5;
 
 impl WindowEventHandler {
     pub fn handle_window_created(
@@ -33,6 +38,8 @@ impl WindowEventHandler {
             reactor.window_manager.observed_window_server_ids.remove(&info.id);
             reactor.window_server_info_manager.window_server_info.insert(info.id, info);
         }
+
+        reactor.clear_constraint_tracking_for_window(wid);
 
         let frame = window.frame;
         let mut window_state: WindowState = window.into();
@@ -89,7 +96,7 @@ impl WindowEventHandler {
             debug!(?wid, "Received WindowDestroyed for unknown window - ignoring");
         }
         reactor.window_manager.windows.remove(&wid);
-        reactor.constraint_probes.remove(&wid);
+        reactor.clear_constraint_tracking_for_window(wid);
         reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
 
         if let DragState::PendingSwap { session, target } = &reactor.drag_manager.drag_state {
@@ -127,7 +134,7 @@ impl WindowEventHandler {
             if let Some(ws_id) = window.info.sys_id {
                 reactor.window_manager.visible_windows.remove(&ws_id);
             }
-            reactor.constraint_probes.remove(&wid);
+            reactor.clear_constraint_tracking_for_window(wid);
             reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
         } else {
             debug!(?wid, "Received WindowMinimized for unknown window - ignoring");
@@ -219,7 +226,10 @@ impl WindowEventHandler {
                     }
                     let inferred = infer_constraint_from_target(new_frame, probe.target);
                     let existing = reactor.layout_manager.layout_engine.window_constraint(wid);
-                    let constraint = merge_constraints(existing, inferred, new_frame, probe.target);
+                    let constraint = {
+                        let evidence = reactor.constraint_evidence.entry(wid).or_default();
+                        merge_constraints(existing, inferred, new_frame, probe.target, evidence)
+                    };
                     reactor.layout_manager.layout_engine.set_window_constraint(wid, constraint);
                     reactor.constraint_probes.remove(&wid);
                     if let Some(app_info) =
@@ -306,8 +316,16 @@ impl WindowEventHandler {
                         let inferred = infer_constraint_from_target(new_frame, target);
                         let existing_constraint =
                             reactor.layout_manager.layout_engine.window_constraint(wid);
-                        let constraint =
-                            merge_constraints(existing_constraint, inferred, new_frame, target);
+                        let constraint = {
+                            let evidence = reactor.constraint_evidence.entry(wid).or_default();
+                            merge_constraints(
+                                existing_constraint,
+                                inferred,
+                                new_frame,
+                                target,
+                                evidence,
+                            )
+                        };
                         reactor.layout_manager.layout_engine.set_window_constraint(wid, constraint);
                         if existing_constraint == Some(constraint) {
                             trace!(
@@ -605,43 +623,65 @@ fn merge_constraints(
     inferred: WindowConstraint,
     new_frame: CGRect,
     target: CGRect,
+    evidence: &mut ConstraintEvidence,
 ) -> WindowConstraint {
-    fn merge_axis(existing: Option<f64>, inferred: Option<f64>) -> Option<f64> {
-        match (existing, inferred) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+    let existing_constraint = existing.unwrap_or(WindowConstraint { max_w: None, max_h: None });
+    let max_w = merge_axis_constraint(
+        existing_constraint.max_w,
+        inferred.max_w,
+        new_frame.size.width,
+        target.size.width,
+        &mut evidence.width,
+    );
+    let max_h = merge_axis_constraint(
+        existing_constraint.max_h,
+        inferred.max_h,
+        new_frame.size.height,
+        target.size.height,
+        &mut evidence.height,
+    );
+
+    WindowConstraint { max_w, max_h }
+}
+
+fn merge_axis_constraint(
+    existing_cap: Option<f64>,
+    inferred_cap: Option<f64>,
+    actual_len: f64,
+    target_len: f64,
+    evidence: &mut ConstraintAxisEvidence,
+) -> Option<f64> {
+    let mut merged = existing_cap;
+
+    if let Some(inferred) = inferred_cap {
+        evidence.reset_clear();
+        if let Some(existing) = existing_cap {
+            evidence.reset_underfill();
+            return Some(existing.min(inferred));
         }
+
+        evidence.note_underfill(inferred.max(0.0));
+        if let Some(confirmed) = evidence.confirmed_cap(CONSTRAINT_CONFIRMATION_SAMPLES) {
+            evidence.reset_underfill();
+            merged = Some(confirmed);
+        }
+        return merged;
     }
 
-    let mut merged = if let Some(existing_constraint) = existing {
-        WindowConstraint {
-            max_w: merge_axis(existing_constraint.max_w, inferred.max_w),
-            max_h: merge_axis(existing_constraint.max_h, inferred.max_h),
+    evidence.reset_underfill();
+    if let Some(cap) = merged {
+        if actual_len > target_len + CONSTRAINT_TARGET_EPS && actual_len > cap + CONSTRAINT_CAP_EPS
+        {
+            evidence.note_clear_candidate();
+            if evidence.should_clear(CONSTRAINT_INVALIDATION_SAMPLES) {
+                evidence.reset_clear();
+                merged = None;
+            }
+        } else {
+            evidence.reset_clear();
         }
     } else {
-        inferred
-    };
-
-    if let Some(existing_constraint) = existing {
-        const CAP_EPS: f64 = 0.5;
-        if inferred.max_w.is_none()
-            && new_frame.size.width > target.size.width + 0.1
-            && existing_constraint
-                .max_w
-                .is_some_and(|cap| new_frame.size.width > cap + CAP_EPS)
-        {
-            merged.max_w = None;
-        }
-        if inferred.max_h.is_none()
-            && new_frame.size.height > target.size.height + 0.1
-            && existing_constraint
-                .max_h
-                .is_some_and(|cap| new_frame.size.height > cap + CAP_EPS)
-        {
-            merged.max_h = None;
-        }
+        evidence.reset_clear();
     }
 
     merged

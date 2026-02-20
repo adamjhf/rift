@@ -118,6 +118,24 @@ fn constrained_resize_clears_pending_target_on_resize_settle() {
     assert_eq!(reactor.transaction_manager.get_target_frame(wsid), None);
     assert_eq!(
         reactor.layout_manager.layout_engine.window_constraint(wid),
+        Some(crate::layout_engine::WindowConstraint { max_w: None, max_h: None })
+    );
+
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, target);
+    let changed = WindowEventHandler::handle_window_frame_changed(
+        &mut reactor,
+        wid,
+        constrained_resize,
+        Some(txid),
+        Requested(true),
+        FrameChangeKind::Resize,
+        None,
+    );
+    assert!(changed);
+    assert_eq!(reactor.transaction_manager.get_target_frame(wsid), None);
+    assert_eq!(
+        reactor.layout_manager.layout_engine.window_constraint(wid),
         Some(crate::layout_engine::WindowConstraint { max_w: Some(420.), max_h: None })
     );
 }
@@ -204,6 +222,23 @@ fn stale_max_constraint_is_cleared_when_window_cannot_shrink_to_cap() {
     reactor.transaction_manager.store_txid(wsid, txid, target);
 
     let actual = CGRect::new(CGPoint::new(0., 0.), CGSize::new(400., 1000.));
+    let changed = WindowEventHandler::handle_window_frame_changed(
+        &mut reactor,
+        wid,
+        actual,
+        Some(txid),
+        Requested(true),
+        FrameChangeKind::Resize,
+        None,
+    );
+    assert!(!changed);
+    assert_eq!(
+        reactor.layout_manager.layout_engine.window_constraint(wid),
+        Some(WindowConstraint { max_w: Some(162.), max_h: None })
+    );
+
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, target);
     let changed = WindowEventHandler::handle_window_frame_changed(
         &mut reactor,
         wid,

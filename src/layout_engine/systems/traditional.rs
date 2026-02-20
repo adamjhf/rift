@@ -2734,6 +2734,43 @@ mod tests {
         assert!(w2_width.is_within(0.5, 700.0));
     }
 
+    #[test]
+    fn constrained_window_still_fills_full_axis_with_multiple_siblings() {
+        let mut system = TraditionalLayoutSystem::default();
+        let layout = system.create_layout();
+        let root = system.root(layout);
+        system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        system.add_window_after_selection(layout, w(3));
+        system.set_window_constraint(w(1), WindowConstraint {
+            max_w: Some(180.0),
+            max_h: None,
+        });
+
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(900.0, 600.0));
+        let gaps = GapSettings::default();
+        let frames = system.calculate_layout(
+            layout,
+            screen,
+            0.0,
+            &gaps,
+            0.0,
+            HorizontalPlacement::Top,
+            VerticalPlacement::Left,
+        );
+
+        let total_width: f64 = frames.iter().map(|(_, frame)| frame.size.width).sum();
+        assert!(total_width.is_within(0.5, 900.0));
+
+        let w1_width = frames.iter().find(|(wid, _)| *wid == w(1)).unwrap().1.size.width;
+        let w2_width = frames.iter().find(|(wid, _)| *wid == w(2)).unwrap().1.size.width;
+        let w3_width = frames.iter().find(|(wid, _)| *wid == w(3)).unwrap().1.size.width;
+        assert!(w1_width.is_within(0.5, 180.0));
+        assert!(w2_width > w1_width);
+        assert!(w3_width > w1_width);
+    }
+
     struct TestTraditionalLayoutSystem {
         system: TraditionalLayoutSystem,
         _root: OwnedNode,

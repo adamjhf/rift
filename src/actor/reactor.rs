@@ -112,6 +112,46 @@ struct ConstraintProbe {
     target: CGRect,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ConstraintAxisEvidence {
+    pending_cap: Option<f64>,
+    constrain_hits: u8,
+    clear_hits: u8,
+}
+
+impl ConstraintAxisEvidence {
+    fn note_underfill(&mut self, cap: f64) {
+        self.pending_cap = Some(self.pending_cap.map_or(cap, |current| current.min(cap)));
+        self.constrain_hits = self.constrain_hits.saturating_add(1);
+        self.clear_hits = 0;
+    }
+
+    fn confirmed_cap(&self, required_samples: u8) -> Option<f64> {
+        if self.constrain_hits >= required_samples {
+            self.pending_cap
+        } else {
+            None
+        }
+    }
+
+    fn reset_underfill(&mut self) {
+        self.pending_cap = None;
+        self.constrain_hits = 0;
+    }
+
+    fn note_clear_candidate(&mut self) { self.clear_hits = self.clear_hits.saturating_add(1); }
+
+    fn reset_clear(&mut self) { self.clear_hits = 0; }
+
+    fn should_clear(&self, required_samples: u8) -> bool { self.clear_hits >= required_samples }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ConstraintEvidence {
+    width: ConstraintAxisEvidence,
+    height: ConstraintAxisEvidence,
+}
+
 use crate::model::server::WindowData;
 
 #[serde_as]
@@ -260,6 +300,7 @@ pub struct Reactor {
     refocus_manager: managers::RefocusManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
     constraint_probes: HashMap<WindowId, ConstraintProbe>,
+    constraint_evidence: HashMap<WindowId, ConstraintEvidence>,
     constraint_probing_enabled: bool,
     active_spaces: HashSet<SpaceId>,
     display_topology_manager: DisplayTopologyManager,
@@ -386,6 +427,7 @@ impl Reactor {
                 topology_relayout_pending: false,
             },
             constraint_probes: HashMap::default(),
+            constraint_evidence: HashMap::default(),
             constraint_probing_enabled: true,
             active_spaces: HashSet::default(),
             display_topology_manager: DisplayTopologyManager::default(),
@@ -418,6 +460,11 @@ impl Reactor {
             return false;
         };
         self.is_space_active(space)
+    }
+
+    fn clear_constraint_tracking_for_window(&mut self, wid: WindowId) {
+        self.constraint_probes.remove(&wid);
+        self.constraint_evidence.remove(&wid);
     }
 
     fn maybe_start_constraint_probe(&mut self, wid: WindowId, space: SpaceId) -> bool {

@@ -4,6 +4,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::{debug, trace};
 
 use super::TransactionId;
+use super::managers::PendingFrameSettleMode;
 use crate::actor::app::{AppThreadHandle, Request, WindowId, pid_t};
 use crate::actor::reactor::Reactor;
 use crate::common::collections::HashMap;
@@ -160,6 +161,13 @@ impl AnimationManager {
             reactor.config.settings.animation_duration,
             reactor.config.settings.animation_easing.clone(),
         );
+        let low_power = power::is_low_power_mode_enabled();
+        let layout_animate = reactor
+            .layout_manager
+            .layout_engine
+            .layout_specific_animate_settings(space)
+            .unwrap_or(reactor.config.settings.animate);
+        let should_run_animation = !is_resize && layout_animate && !low_power;
         let mut animated_count = 0;
         let mut animated_wids_wsids: Vec<u32> = Vec::new();
         let mut any_frame_changed = false;
@@ -212,6 +220,12 @@ impl AnimationManager {
                 animated_count += 1;
                 if let Some(wsid) = window_server_id {
                     reactor.transaction_manager.update_txid_entries([(wsid, txid, target_frame)]);
+                    let settle_mode = if should_run_animation {
+                        PendingFrameSettleMode::Animated
+                    } else {
+                        PendingFrameSettleMode::Immediate
+                    };
+                    reactor.frame_convergence_manager.note_request(wsid, txid, settle_mode);
                 }
             } else {
                 trace!(
@@ -222,6 +236,11 @@ impl AnimationManager {
                 );
                 if let Some(wsid) = window_server_id {
                     reactor.transaction_manager.update_txid_entries([(wsid, txid, target_frame)]);
+                    reactor.frame_convergence_manager.note_request(
+                        wsid,
+                        txid,
+                        PendingFrameSettleMode::Immediate,
+                    );
                 }
                 if let Err(e) =
                     app_state.handle.send(Request::SetWindowFrame(wid, target_frame, txid, true))
@@ -237,14 +256,7 @@ impl AnimationManager {
         }
 
         if animated_count > 0 {
-            let low_power = power::is_low_power_mode_enabled();
-            let layout_animate = reactor
-                .layout_manager
-                .layout_engine
-                .layout_specific_animate_settings(space)
-                .unwrap_or(reactor.config.settings.animate);
-
-            if is_resize || !layout_animate || low_power {
+            if !should_run_animation {
                 anim.skip_to_end();
             } else {
                 anim.run();
@@ -322,7 +334,15 @@ impl AnimationManager {
                         }
                     }
                 }
+                let entries_for_settle = txid_entries.clone();
                 reactor.transaction_manager.update_txid_entries(txid_entries);
+                for (wsid, txid, _) in entries_for_settle {
+                    reactor.frame_convergence_manager.note_request(
+                        wsid,
+                        txid,
+                        PendingFrameSettleMode::Immediate,
+                    );
+                }
             }
 
             let frames_to_send = frames.clone();

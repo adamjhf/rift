@@ -642,3 +642,295 @@ fn topology_relayout_pending_when_space_ids_change_for_same_displays() {
         "Space-id churn on unchanged displays should trigger topology relayout"
     );
 }
+
+#[test]
+fn constrained_mismatch_reconciles_layout_and_expands_peer() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+    let space = SpaceId::new(1);
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    apps.simulate_until_quiet(&mut reactor);
+
+    reactor.handle_events(apps.make_app(2, make_windows(1)));
+    let initial_requests = apps.requests();
+    assert!(
+        !initial_requests.is_empty(),
+        "expected initial layout requests after second app launch"
+    );
+
+    let target_wid = WindowId::new(2, 1);
+    let peer_wid = WindowId::new(1, 1);
+    let mut target_txid = None;
+    let mut target_frame = None;
+    let mut peer_initial_frame = None;
+
+    for request in &initial_requests {
+        match request {
+            Request::SetWindowFrame(wid, frame, txid, _) => {
+                if *wid == target_wid {
+                    target_txid = Some(*txid);
+                    target_frame = Some(*frame);
+                }
+                if *wid == peer_wid {
+                    peer_initial_frame = Some(*frame);
+                }
+            }
+            Request::SetBatchWindowFrame(frames, txid) => {
+                for (wid, frame) in frames {
+                    if *wid == target_wid {
+                        target_txid = Some(*txid);
+                        target_frame = Some(*frame);
+                    }
+                    if *wid == peer_wid {
+                        peer_initial_frame = Some(*frame);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let target_txid = target_txid.expect("missing txid for constrained candidate");
+    let target_frame = target_frame.expect("missing target frame for constrained candidate");
+    let peer_initial_frame = peer_initial_frame.expect("missing peer frame before constraint");
+    assert!(
+        target_frame.size.width > 350.0,
+        "expected a sizeable target frame for constrained candidate, got {:?}",
+        target_frame
+    );
+
+    let shrink_width_axis = target_frame.size.width < screen.size.width - 5.0;
+    let constrained_frame = if shrink_width_axis {
+        CGRect::new(
+            target_frame.origin,
+            CGSize::new(
+                (target_frame.size.width - 220.0).max(150.0),
+                target_frame.size.height,
+            ),
+        )
+    } else {
+        CGRect::new(
+            target_frame.origin,
+            CGSize::new(
+                target_frame.size.width,
+                (target_frame.size.height - 220.0).max(150.0),
+            ),
+        )
+    };
+
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        constrained_frame,
+        Some(target_txid),
+        Requested(true),
+        None,
+    ));
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        constrained_frame,
+        Some(target_txid),
+        Requested(true),
+        None,
+    ));
+
+    let followup_requests = apps.requests();
+    assert!(
+        !followup_requests.is_empty(),
+        "expected relayout requests after constrained mismatch"
+    );
+
+    let mut peer_followup_frame = None;
+    for request in &followup_requests {
+        match request {
+            Request::SetWindowFrame(wid, frame, ..) if *wid == peer_wid => {
+                peer_followup_frame = Some(*frame);
+            }
+            Request::SetBatchWindowFrame(frames, ..) => {
+                for (wid, frame) in frames {
+                    if *wid == peer_wid {
+                        peer_followup_frame = Some(*frame);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let peer_followup_frame = peer_followup_frame
+        .expect(&format!("missing peer follow-up frame: {:?}", followup_requests));
+    if shrink_width_axis {
+        assert!(
+            peer_followup_frame.size.width > peer_initial_frame.size.width + 100.0,
+            "peer should expand width after constrained mismatch: initial={:?}, followup={:?}",
+            peer_initial_frame,
+            peer_followup_frame
+        );
+    } else {
+        assert!(
+            peer_followup_frame.size.height > peer_initial_frame.size.height + 100.0,
+            "peer should expand height after constrained mismatch: initial={:?}, followup={:?}",
+            peer_initial_frame,
+            peer_followup_frame
+        );
+    }
+}
+
+#[test]
+fn trailing_requested_callbacks_for_same_tx_do_not_retrigger_writes() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+    let space = SpaceId::new(1);
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    apps.simulate_until_quiet(&mut reactor);
+    reactor.handle_events(apps.make_app(2, make_windows(1)));
+
+    let initial_requests = apps.requests();
+    let target_wid = WindowId::new(2, 1);
+    let mut target_txid = None;
+    let mut target_frame = None;
+    for request in &initial_requests {
+        match request {
+            Request::SetWindowFrame(wid, frame, txid, _) if *wid == target_wid => {
+                target_txid = Some(*txid);
+                target_frame = Some(*frame);
+            }
+            Request::SetBatchWindowFrame(frames, txid) => {
+                for (wid, frame) in frames {
+                    if *wid == target_wid {
+                        target_txid = Some(*txid);
+                        target_frame = Some(*frame);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let target_txid = target_txid.expect("missing txid for target window");
+    let target_frame = target_frame.expect("missing target frame for target window");
+    let constrained_frame = CGRect::new(
+        target_frame.origin,
+        CGSize::new(
+            (target_frame.size.width - 220.0).max(150.0),
+            target_frame.size.height,
+        ),
+    );
+
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        constrained_frame,
+        Some(target_txid),
+        Requested(true),
+        None,
+    ));
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        constrained_frame,
+        Some(target_txid),
+        Requested(true),
+        None,
+    ));
+
+    let _ = apps.requests();
+
+    let trailing = CGRect::new(
+        CGPoint::new(
+            constrained_frame.origin.x + 15.0,
+            constrained_frame.origin.y + 1.0,
+        ),
+        constrained_frame.size,
+    );
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        trailing,
+        Some(target_txid),
+        Requested(true),
+        None,
+    ));
+
+    let trailing_requests = apps.requests();
+    assert!(
+        trailing_requests.is_empty(),
+        "trailing same-tx requested callbacks should not trigger extra writes: {:?}",
+        trailing_requests
+    );
+}
+
+#[test]
+fn small_requested_false_mismatches_do_not_retrigger_layout_writes() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+    let space = SpaceId::new(1);
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    let initial_requests = apps.requests();
+    assert!(
+        !initial_requests.is_empty(),
+        "expected initial layout requests for first window"
+    );
+
+    let target_wid = WindowId::new(1, 1);
+    let mut target_txid = None;
+    let mut target_frame = None;
+    for request in &initial_requests {
+        match request {
+            Request::SetWindowFrame(wid, frame, txid, _) if *wid == target_wid => {
+                target_txid = Some(*txid);
+                target_frame = Some(*frame);
+            }
+            Request::SetBatchWindowFrame(frames, txid) => {
+                for (wid, frame) in frames {
+                    if *wid == target_wid {
+                        target_txid = Some(*txid);
+                        target_frame = Some(*frame);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let target_txid = target_txid.expect("missing txid for target window");
+    let target_frame = target_frame.expect("missing target frame for target window");
+    let settled_mismatch = CGRect::new(
+        target_frame.origin,
+        CGSize::new(
+            target_frame.size.width,
+            (target_frame.size.height - 2.0).max(1.0),
+        ),
+    );
+
+    reactor.handle_event(Event::WindowFrameChanged(
+        target_wid,
+        settled_mismatch,
+        Some(target_txid),
+        Requested(false),
+        None,
+    ));
+
+    let followup_requests = apps.requests();
+    assert!(
+        followup_requests.is_empty(),
+        "small settle mismatches should not trigger a new layout write: {:?}",
+        followup_requests
+    );
+}

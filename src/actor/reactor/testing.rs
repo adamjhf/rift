@@ -271,7 +271,7 @@ impl Apps {
                         wid,
                         window.frame,
                         Some(window.last_seen_txid),
-                        Requested(true),
+                        Requested(false),
                         None,
                     ));
                 }

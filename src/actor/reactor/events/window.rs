@@ -3,6 +3,7 @@ use tracing::{debug, trace, warn};
 
 use crate::actor::app::WindowId;
 use crate::actor::reactor::events::drag::DragEventHandler;
+use crate::actor::reactor::managers::PendingFrameSettleMode;
 use crate::actor::reactor::{
     DragState, Quiet, Reactor, Requested, TransactionId, WindowFilter, WindowState, utils,
 };
@@ -81,6 +82,7 @@ impl WindowEventHandler {
         };
         if let Some(ws_id) = window_server_id {
             reactor.transaction_manager.remove_for_window(ws_id);
+            reactor.clear_pending_frame_request_state(ws_id);
             reactor.window_manager.window_ids.remove(&ws_id);
             reactor.window_server_info_manager.window_server_info.remove(&ws_id);
             reactor.window_manager.visible_windows.remove(&ws_id);
@@ -220,6 +222,7 @@ impl WindowEventHandler {
             if effective_mouse_state == Some(MouseState::Down) && triggered_by_rift {
                 if let Some((wsid, _)) = pending_target {
                     reactor.transaction_manager.clear_target_for_window(wsid);
+                    reactor.clear_pending_frame_request_state(wsid);
                 }
                 triggered_by_rift = false;
                 has_pending_request = false;
@@ -231,34 +234,91 @@ impl WindowEventHandler {
             }
 
             if triggered_by_rift {
-                let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
-                    return false;
-                };
-
                 if let Some((wsid, target)) = pending_target {
                     if new_frame.same_as(target) {
+                        let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                            return false;
+                        };
                         if !window.frame_monotonic.same_as(new_frame) {
                             debug!(?wid, ?new_frame, "Final frame matches Rift request");
                             window.frame_monotonic = new_frame;
                         }
                         reactor.transaction_manager.clear_target_for_window(wsid);
+                        reactor.clear_pending_frame_request_state(wsid);
                     } else {
+                        let settle_mode = reactor
+                            .pending_frame_settle_mode(wsid, last_sent_txid)
+                            .unwrap_or(PendingFrameSettleMode::Immediate);
+                        let mismatch_repeats =
+                            reactor.record_pending_frame_mismatch(wsid, last_sent_txid, new_frame);
+                        let settle_mismatch = match settle_mode {
+                            PendingFrameSettleMode::Immediate => {
+                                !requested.0 || mismatch_repeats >= 2
+                            }
+                            PendingFrameSettleMode::Animated => {
+                                !requested.0 || mismatch_repeats >= 2
+                            }
+                        };
+                        if !settle_mismatch {
+                            trace!(
+                                ?wid,
+                                ?new_frame,
+                                ?target,
+                                ?settle_mode,
+                                mismatch_repeats,
+                                "Waiting for settled frame mismatch sample"
+                            );
+                            return false;
+                        }
+
+                        let significant_underfill = is_significant_underfill(target, new_frame);
+                        let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                            return false;
+                        };
+                        if significant_underfill {
+                            if !window.frame_monotonic.same_as(new_frame) {
+                                window.frame_monotonic = new_frame;
+                            }
+                        } else if !window.frame_monotonic.same_as(target) {
+                            window.frame_monotonic = target;
+                        }
+                        reactor.transaction_manager.clear_target_for_window(wsid);
+                        reactor.clear_pending_frame_request_state(wsid);
+
+                        if significant_underfill
+                            && active_space_for_window(reactor, &new_frame, server_id).is_some()
+                        {
+                            reactor.send_layout_event(LayoutEvent::WindowResized {
+                                wid,
+                                old_frame: target,
+                                new_frame,
+                                screens: collect_layout_resize_screens(reactor),
+                            });
+                            return true;
+                        }
+
                         trace!(
                             ?wid,
                             ?new_frame,
                             ?target,
-                            "Skipping intermediate frame from Rift request"
+                            "Settled non-matching frame from Rift request"
                         );
                     }
-                } else if !window.frame_monotonic.same_as(new_frame) {
-                    debug!(
-                        ?wid,
-                        ?new_frame,
-                        "Rift frame event missing tx record; updating state"
-                    );
-                    window.frame_monotonic = new_frame;
-                    if let Some(wsid) = window.info.sys_id {
-                        reactor.transaction_manager.clear_target_for_window(wsid);
+                } else {
+                    let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                        return false;
+                    };
+                    if !window.frame_monotonic.same_as(new_frame) {
+                        debug!(
+                            ?wid,
+                            ?new_frame,
+                            "Rift frame event missing tx record; updating state"
+                        );
+                        window.frame_monotonic = new_frame;
+                        if let Some(wsid) = window.info.sys_id {
+                            reactor.transaction_manager.clear_target_for_window(wsid);
+                            reactor.clear_pending_frame_request_state(wsid);
+                        }
                     }
                 }
 
@@ -266,6 +326,25 @@ impl WindowEventHandler {
             }
 
             if requested.0 {
+                if last_seen.is_some_and(|seen| seen == last_sent_txid) {
+                    trace!(
+                        ?wid,
+                        ?new_frame,
+                        ?last_seen,
+                        "Ignoring trailing requested callback for current tx"
+                    );
+                    return false;
+                }
+                if last_seen.is_some_and(|seen| seen != last_sent_txid) {
+                    trace!(
+                        ?wid,
+                        ?new_frame,
+                        ?last_seen,
+                        ?last_sent_txid,
+                        "Ignoring stale requested callback with mismatched tx"
+                    );
+                    return false;
+                }
                 if let Some(window) = reactor.window_manager.windows.get_mut(&wid) {
                     if !window.frame_monotonic.same_as(new_frame) {
                         debug!(
@@ -278,6 +357,7 @@ impl WindowEventHandler {
                 }
                 if let Some(wsid) = server_id {
                     reactor.transaction_manager.clear_target_for_window(wsid);
+                    reactor.clear_pending_frame_request_state(wsid);
                 }
                 return false;
             }
@@ -313,20 +393,11 @@ impl WindowEventHandler {
                 let is_resize = !old_frame.size.same_as(new_frame.size);
                 if is_resize {
                     if active_space_for_window(reactor, &new_frame, server_id).is_some() {
-                        let screens = reactor
-                            .space_manager
-                            .screens
-                            .iter()
-                            .filter_map(|screen| {
-                                let display_uuid = screen.display_uuid_owned();
-                                Some((screen.space?, screen.frame, display_uuid))
-                            })
-                            .collect::<Vec<_>>();
                         reactor.send_layout_event(LayoutEvent::WindowResized {
                             wid,
                             old_frame,
                             new_frame,
-                            screens,
+                            screens: collect_layout_resize_screens(reactor),
                         });
                     }
                 } else {
@@ -380,21 +451,11 @@ impl WindowEventHandler {
                 } else if !old_frame.size.same_as(new_frame.size) {
                     if let Some(space) = old_space {
                         if reactor.is_space_active(space) {
-                            let screens = reactor
-                                .space_manager
-                                .screens
-                                .iter()
-                                .filter_map(|screen| {
-                                    let space = screen.space?;
-                                    let display_uuid = screen.display_uuid_owned();
-                                    Some((space, screen.frame, display_uuid))
-                                })
-                                .collect::<Vec<_>>();
                             reactor.send_layout_event(LayoutEvent::WindowResized {
                                 wid,
                                 old_frame,
                                 new_frame,
-                                screens,
+                                screens: collect_layout_resize_screens(reactor),
                             });
                             return true;
                         }
@@ -469,6 +530,25 @@ fn maybe_dispatch_window_added_in_space(reactor: &mut Reactor, wid: WindowId, sp
     if should_dispatch {
         reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
     }
+}
+
+fn collect_layout_resize_screens(reactor: &Reactor) -> Vec<(SpaceId, CGRect, Option<String>)> {
+    reactor
+        .space_manager
+        .screens
+        .iter()
+        .filter_map(|screen| {
+            let space = screen.space?;
+            let display_uuid = screen.display_uuid_owned();
+            Some((space, screen.frame, display_uuid))
+        })
+        .collect()
+}
+
+fn is_significant_underfill(target: CGRect, actual: CGRect) -> bool {
+    const EPSILON: f64 = 3.0;
+    (target.size.width - actual.size.width) > EPSILON
+        || (target.size.height - actual.size.height) > EPSILON
 }
 
 fn handle_mouse_up_if_needed(reactor: &mut Reactor, mouse_state: Option<MouseState>) {

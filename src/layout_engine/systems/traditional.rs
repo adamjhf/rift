@@ -1780,7 +1780,10 @@ impl TraditionalLayoutSystem {
                     first_direction = Some(direction);
                 }
                 if resize {
-                    self.resize_internal(node, f64::from(delta) / f64::from(whole), direction);
+                    let ratio = f64::from(delta) / f64::from(whole);
+                    if !self.resize_internal(node, ratio, direction) {
+                        let _ = self.resize_internal(node, ratio, direction.opposite());
+                    }
                 }
             }
             good

@@ -293,8 +293,8 @@ impl State {
     }
 
     fn txid_for_window_state(&self, window: &AppWindowState) -> Option<TransactionId> {
-        self.txid_from_store(window.window_server_id)
-            .or_else(|| Self::some_txid(window.last_seen_txid))
+        Self::some_txid(window.last_seen_txid)
+            .or_else(|| self.txid_from_store(window.window_server_id))
     }
 
     fn some_txid(txid: TransactionId) -> Option<TransactionId> {
@@ -541,6 +541,10 @@ impl State {
                     let _ = elem.set_position(pos);
                 };
 
+                if is_animating {
+                    return Ok(false);
+                }
+
                 let frame =
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
                         Some(frame) => frame,
@@ -584,6 +588,10 @@ impl State {
                     let _ = elem.set_size(desired.size);
                 }
 
+                if is_animating {
+                    return Ok(false);
+                }
+
                 let frame =
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
                         Some(frame) => frame,
@@ -602,10 +610,10 @@ impl State {
                 let app = self.app.clone();
                 let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
                     for (wid, desired) in frames.iter() {
-                        let elem = match self.window_mut(*wid) {
+                        let (elem, is_animating) = match self.window_mut(*wid) {
                             Ok(window) => {
                                 window.last_seen_txid = txid;
-                                window.elem.clone()
+                                (window.elem.clone(), window.is_animating)
                             }
                             Err(err) => match err {
                                 AxError::Ax(code) => {
@@ -621,6 +629,10 @@ impl State {
                         let _ = elem.set_size(desired.size);
                         let _ = elem.set_position(desired.origin);
                         let _ = elem.set_size(desired.size);
+
+                        if is_animating {
+                            continue;
+                        }
 
                         let frame = match self.handle_ax_result(*wid, elem.frame())? {
                             Some(frame) => frame,
@@ -685,7 +697,7 @@ impl State {
                     wid,
                     frame,
                     txid,
-                    Requested(true),
+                    Requested(false),
                     None,
                 ));
                 SLSReenableUpdate(*G_CONNECTION);

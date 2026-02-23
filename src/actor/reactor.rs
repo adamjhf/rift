@@ -252,6 +252,7 @@ pub struct Reactor {
     mission_control_manager: managers::MissionControlManager,
     refocus_manager: managers::RefocusManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
+    frame_convergence_manager: managers::FrameConvergenceManager,
     active_spaces: HashSet<SpaceId>,
     display_topology_manager: DisplayTopologyManager,
 }
@@ -373,6 +374,7 @@ impl Reactor {
                 pending_space_change: None,
                 topology_relayout_pending: false,
             },
+            frame_convergence_manager: managers::FrameConvergenceManager::new(),
             active_spaces: HashSet::default(),
             display_topology_manager: DisplayTopologyManager::default(),
         }
@@ -2966,5 +2968,26 @@ impl Reactor {
             warn!(error = ?e, "{}", context);
             false
         })
+    }
+
+    fn pending_frame_settle_mode(
+        &mut self,
+        wsid: WindowServerId,
+        txid: TransactionId,
+    ) -> Option<managers::PendingFrameSettleMode> {
+        self.frame_convergence_manager.settle_mode_for(wsid, txid)
+    }
+
+    fn record_pending_frame_mismatch(
+        &mut self,
+        wsid: WindowServerId,
+        txid: TransactionId,
+        frame: CGRect,
+    ) -> u8 {
+        self.frame_convergence_manager.record_mismatch(wsid, txid, frame)
+    }
+
+    fn clear_pending_frame_request_state(&mut self, wsid: WindowServerId) {
+        self.frame_convergence_manager.clear_window(wsid);
     }
 }

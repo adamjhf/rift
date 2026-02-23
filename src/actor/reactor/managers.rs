@@ -5,8 +5,8 @@ use tracing::trace;
 
 use super::replay::Record;
 use super::{
-    AppState, Event, FullscreenSpaceTrack, PendingSpaceChange, ScreenInfo, WindowState,
-    WorkspaceSwitchOrigin, WorkspaceSwitchState,
+    AppState, Event, FullscreenSpaceTrack, PendingSpaceChange, ScreenInfo, TransactionId,
+    WindowState, WorkspaceSwitchOrigin, WorkspaceSwitchState,
 };
 use crate::actor;
 use crate::actor::app::{WindowId, pid_t};
@@ -18,6 +18,7 @@ use crate::actor::{event_tap, menu_bar, raise_manager, stack_line, window_notify
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{LayoutMode, WindowSnappingSettings};
 use crate::layout_engine::LayoutEngine;
+use crate::sys::geometry::SameAs;
 use crate::sys::screen::SpaceId;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
@@ -436,11 +437,111 @@ pub struct PendingSpaceChangeManager {
     pub topology_relayout_pending: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingFrameSettleMode {
+    Immediate,
+    Animated,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingFrameSettle {
+    pub txid: TransactionId,
+    pub mode: PendingFrameSettleMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingFrameMismatch {
+    pub txid: TransactionId,
+    pub frame: CGRect,
+    pub repeats: u8,
+}
+
+pub struct FrameConvergenceManager {
+    pub pending: HashMap<WindowServerId, PendingFrameSettle>,
+    pub mismatches: HashMap<WindowServerId, PendingFrameMismatch>,
+}
+
+impl FrameConvergenceManager {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::default(),
+            mismatches: HashMap::default(),
+        }
+    }
+
+    pub fn note_request(
+        &mut self,
+        wsid: WindowServerId,
+        txid: TransactionId,
+        mode: PendingFrameSettleMode,
+    ) {
+        let reset_mismatch = match self.pending.get(&wsid) {
+            Some(existing) => existing.txid != txid,
+            None => true,
+        };
+        self.pending.insert(wsid, PendingFrameSettle { txid, mode });
+        if reset_mismatch {
+            self.mismatches.remove(&wsid);
+        }
+    }
+
+    pub fn settle_mode_for(
+        &mut self,
+        wsid: WindowServerId,
+        txid: TransactionId,
+    ) -> Option<PendingFrameSettleMode> {
+        let entry = self.pending.get(&wsid).copied()?;
+        if entry.txid != txid {
+            self.pending.remove(&wsid);
+            self.mismatches.remove(&wsid);
+            return None;
+        }
+        Some(entry.mode)
+    }
+
+    pub fn record_mismatch(
+        &mut self,
+        wsid: WindowServerId,
+        txid: TransactionId,
+        frame: CGRect,
+    ) -> u8 {
+        let repeats = match self.mismatches.get_mut(&wsid) {
+            Some(sample) if sample.txid == txid && sample.frame.same_as(frame) => {
+                sample.repeats = sample.repeats.saturating_add(1).max(1);
+                sample.repeats
+            }
+            Some(sample) if sample.txid == txid => {
+                sample.frame = frame;
+                sample.repeats = 1;
+                1
+            }
+            Some(sample) => {
+                sample.txid = txid;
+                sample.frame = frame;
+                sample.repeats = 1;
+                1
+            }
+            None => {
+                self.mismatches.insert(wsid, PendingFrameMismatch { txid, frame, repeats: 1 });
+                1
+            }
+        };
+        repeats
+    }
+
+    pub fn clear_window(&mut self, wsid: WindowServerId) {
+        self.pending.remove(&wsid);
+        self.mismatches.remove(&wsid);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::bound_frame_to_screen;
+    use super::{FrameConvergenceManager, PendingFrameSettleMode, bound_frame_to_screen};
+    use crate::actor::reactor::transaction_manager::TransactionId;
+    use crate::sys::window_server::WindowServerId;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -480,5 +581,35 @@ mod tests {
         let bounded = bound_frame_to_screen(frame, screen);
         assert_eq!(bounded.origin.x, 2998.0);
         assert_eq!(bounded.size.width, 600.0);
+    }
+
+    #[test]
+    fn frame_convergence_resets_mismatch_when_tx_changes() {
+        let wsid = WindowServerId::new(12);
+        let mut manager = FrameConvergenceManager::new();
+        let tx1 = TransactionId::default().next();
+        let tx2 = tx1.next();
+        let frame = rect(0.0, 0.0, 500.0, 500.0);
+
+        manager.note_request(wsid, tx1, PendingFrameSettleMode::Immediate);
+        assert_eq!(manager.record_mismatch(wsid, tx1, frame), 1);
+        assert_eq!(manager.record_mismatch(wsid, tx1, frame), 2);
+
+        manager.note_request(wsid, tx2, PendingFrameSettleMode::Animated);
+        assert_eq!(manager.record_mismatch(wsid, tx2, frame), 1);
+    }
+
+    #[test]
+    fn frame_convergence_reuses_settle_mode_for_matching_txid() {
+        let wsid = WindowServerId::new(33);
+        let mut manager = FrameConvergenceManager::new();
+        let txid = TransactionId::default().next();
+
+        manager.note_request(wsid, txid, PendingFrameSettleMode::Animated);
+        assert_eq!(
+            manager.settle_mode_for(wsid, txid),
+            Some(PendingFrameSettleMode::Animated)
+        );
+        assert_eq!(manager.settle_mode_for(wsid, txid.next()), None);
     }
 }
